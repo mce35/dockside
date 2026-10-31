@@ -35,14 +35,16 @@ from terminal_colors import (
     ANSI_YELLOW,
 )
 
-_SORT_COLUMNS = ("id", "status", "name", "freshness", "image")
+_SORT_COLUMNS = ("id", "status", "name", "ports", "freshness", "image")
 _SORT_LABELS = {
 	"id": "CONTAINER ID",
 	"status": "STATUS",
 	"name": "NAME",
+	"ports": "PORTS",
 	"freshness": "LATEST?",
 	"image": "IMAGE",
 }
+_PORTS_COLUMN_WIDTH = 32
 
 
 def _show_containers(
@@ -103,6 +105,31 @@ def _paint_span(line: str, start: int, width: int, color: str) -> str:
 	return f"{line[:start]}{color}{line[start:end]}{ANSI_RESET_FG}{line[end:]}"
 
 
+def _action_line_color(line: str) -> str | None:
+	message = line.partition("] ")[2] or line
+	if message.startswith("ERROR"):
+		return ANSI_RED
+	if message.startswith(
+		(
+			"Started container ",
+			"Stopped container ",
+			"Restarted container ",
+			"Deleted container ",
+			"Image pull completed for container ",
+			"Previous configuration restored for ",
+			"Container log view closed.",
+		)
+	) or (message.startswith("Container ") and " recreated successfully." in message):
+		return ANSI_GREEN
+	return None
+
+
+def _color_action_line(line: str, width: int) -> str:
+	visible_line = line[:width]
+	color = _action_line_color(visible_line)
+	return f"{color}{visible_line}{ANSI_RESET_FG}" if color else visible_line
+
+
 def _status_color(container: dict[str, Any]) -> str:
 	status = container.get("Status", "").casefold()
 	state = container.get("State", "").casefold()
@@ -125,6 +152,41 @@ def _image_label(container: dict[str, Any], freshness: str) -> str:
 	return f"Original: {image} (Current: {current_image})"
 
 
+def _container_port_labels(container: dict[str, Any]) -> list[str]:
+	ports = []
+	for port in container.get("Ports") or []:
+		private_port = port.get("PrivatePort")
+		protocol = port.get("Type", "tcp")
+		if private_port is None:
+			continue
+		if port.get("PublicPort") is not None:
+			binding = f"{port['PublicPort']}->{private_port}/{protocol}"
+			is_unpublished = False
+		else:
+			binding = f"{private_port}/{protocol}"
+			is_unpublished = True
+		ports.append((is_unpublished, binding))
+	return [binding for _, binding in sorted(set(ports))]
+
+
+def _container_ports(container: dict[str, Any]) -> str:
+	return ", ".join(_container_port_labels(container))
+
+
+def _container_ports_cell(container: dict[str, Any], width: int) -> str:
+	labels = _container_port_labels(container)
+	for visible_count in range(len(labels), 0, -1):
+		visible = ", ".join(labels[:visible_count])
+		remaining = len(labels) - visible_count
+		if remaining:
+			visible += f", +{remaining}"
+		if len(visible) <= width:
+			return visible
+	if labels:
+		return labels[0][: max(0, width - 3)] + "..."[:width]
+	return ""
+
+
 def _sort_label(column: str, sort_column: str, sort_ascending: bool) -> str:
 	label = _SORT_LABELS[column]
 	if column == sort_column:
@@ -143,6 +205,8 @@ def _sort_containers(
 			return container.get("Id", "").casefold()
 		if sort_column == "status":
 			return container.get("Status", "").casefold()
+		if sort_column == "ports":
+			return _container_ports(container).casefold()
 		if sort_column == "freshness":
 			return image_freshness.get(container.get("Id", ""), "UNKNOWN").casefold()
 		if sort_column == "image":
@@ -169,8 +233,9 @@ def _render_container_picker(
 	column_header = (
 		f"{'':3}  {' ':3}  "
 		f"{_sort_label('id', sort_column, sort_ascending):12}  "
-		f"{_sort_label('status', sort_column, sort_ascending):20}  "
-		f"{_sort_label('name', sort_column, sort_ascending):24}  "
+		f"{_sort_label('status', sort_column, sort_ascending):8}  "
+		f"{_sort_label('name', sort_column, sort_ascending):16}  "
+		f"{_sort_label('ports', sort_column, sort_ascending):{_PORTS_COLUMN_WIDTH}}  "
 		f"{_sort_label('freshness', sort_column, sort_ascending):8}  "
 		f"{_sort_label('image', sort_column, sort_ascending)}"
 	)
@@ -244,13 +309,17 @@ def _render_container_picker(
 		container = containers[index]
 		marker = "[x]" if container["Id"] in selected_ids else "[ ]"
 		prefix = f"{index + 1:>3}  {marker:3}  {container['Id'][:12]:12}  "
-		status = container.get("Status", "")[:20]
-		name = _container_name(container)[:24]
+		status = container.get("Status", "")[:8]
+		name = _container_name(container)[:16]
+		ports = _container_ports_cell(container, _PORTS_COLUMN_WIDTH)
 		freshness = image_freshness.get(container["Id"], "UNKNOWN")
 		image = _image_label(container, freshness)
-		freshness_start = len(prefix) + 20 + 2 + 24 + 2
+		freshness_start = (
+			len(prefix) + 8 + 2 + 16 + 2 + _PORTS_COLUMN_WIDTH + 2
+		)
 		line = (
-			f"{prefix}{status:20}  {name:24}  "
+			f"{prefix}{status:8}  {name:16}  "
+			f"{ports:{_PORTS_COLUMN_WIDTH}}  "
 			f"{freshness:8}  "
 			f"{image}"
 		)[:columns]
@@ -260,7 +329,7 @@ def _render_container_picker(
 			"UNKNOWN": ANSI_BLUE,
 		}.get(freshness, ANSI_BLUE)
 		line = _paint_span(line, freshness_start, 8, freshness_color)
-		line = _paint_span(line, len(prefix), 20, _status_color(container))
+		line = _paint_span(line, len(prefix), 8, _status_color(container))
 		if container["Id"] in selected_ids:
 			line = f"{ANSI_LIGHT_GREEN_BG}{line.ljust(columns)}{ANSI_RESET_BG}"
 			if index == active_index:
@@ -282,7 +351,7 @@ def _render_container_picker(
 		lines.append(action_label[:columns])
 		if not action_total and action_line_count:
 			lines.append("No actions yet."[:columns])
-		lines.extend(line[:columns] for line in action_lines)
+		lines.extend(_color_action_line(line, columns) for line in action_lines)
 	if show_separators:
 		lines.append("-" * columns)
 	lines.extend(line[:columns] for line in footer_lines)
