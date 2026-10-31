@@ -104,25 +104,18 @@ def _container_name(container: dict[str, Any]) -> str:
 	return names[0].lstrip("/") if names else container["Id"][:12]
 
 
-def _prepare_recreate(api: DockerAPI, container_id: str) -> RecreatePlan | None:
+def _prepare_recreate(
+	api: DockerAPI,
+	container_id: str,
+) -> RecreatePlan:
 	inspection = api.inspect_container(container_id)
 	name = inspection.get("Name", "").lstrip("/") or container_id[:12]
 	config = inspection.get("Config") or {}
 	image = config.get("Image") or inspection.get("Image")
 	if not image:
 		raise DockerError("Could not determine the container's image.")
-	pull_first = input(f"Pull {image} before recreating? [y/N]: ").strip().casefold() in {
-		"y",
-		"yes",
-	}
 	was_running = bool(inspection.get("State", {}).get("Running"))
 	auto_remove = bool((inspection.get("HostConfig") or {}).get("AutoRemove"))
-	if auto_remove:
-		print("Warning: this container uses auto-remove; anonymous volume data may be removed when it stops.")
-	print(f"Recreating {name} replaces the current container. Configured mounts will be reused where available.")
-	if input(f'Type "{name}" to continue: ').strip() != name:
-		print("Recreation cancelled.")
-		return None
 	return RecreatePlan(
 		container_id=container_id,
 		name=name,
@@ -131,7 +124,7 @@ def _prepare_recreate(api: DockerAPI, container_id: str) -> RecreatePlan | None:
 		payload=_create_payload(inspection, image),
 		was_running=was_running,
 		auto_remove=auto_remove,
-		pull_first=pull_first,
+		pull_first=False,
 	)
 
 

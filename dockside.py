@@ -500,16 +500,15 @@ def _select_containers(
 		sys.stdout.flush()
 
 
-def _confirm_delete(container_names: list[str]) -> bool:
+def _confirm_dialog(
+	prompt: str,
+	container_names: list[str],
+	details: list[str] | None = None,
+) -> bool | None:
 	selected_yes = True
 	file_descriptor = sys.stdin.fileno()
 	original_terminal = termios.tcgetattr(file_descriptor)
 	columns = max(1, shutil.get_terminal_size((80, 24)).columns - 1)
-	count_label = (
-		f"Delete container {container_names[0]}?"
-		if len(container_names) == 1
-		else f"Delete {len(container_names)} selected containers?"
-	)
 	container_lines = [f"  - {name}"[:columns] for name in container_names]
 	try:
 		tty.setraw(file_descriptor)
@@ -520,7 +519,11 @@ def _confirm_delete(container_names: list[str]) -> bool:
 				yes_label = f"\033[7m{yes_label}\033[0m"
 			else:
 				no_label = f"\033[7m{no_label}\033[0m"
-			dialog_lines = [count_label, "", "Containers:", *container_lines, ""]
+			dialog_lines = [prompt[:columns], ""]
+			if details:
+				dialog_lines.extend(line[:columns] for line in details)
+				dialog_lines.append("")
+			dialog_lines.extend(["Containers:", *container_lines, ""])
 			dialog_lines.extend(
 				[
 					f"{yes_label}    {no_label}",
@@ -534,7 +537,7 @@ def _confirm_delete(container_names: list[str]) -> bool:
 			if character == "\x1b":
 				readable, _, _ = select.select([file_descriptor], [], [], 0.1)
 				if not readable:
-					return False
+					return None
 				sequence = os.read(file_descriptor, 2)
 				if sequence in {b"[D", b"OD"}:
 					selected_yes = True
@@ -548,11 +551,20 @@ def _confirm_delete(container_names: list[str]) -> bool:
 			elif character in {"y", "Y"}:
 				selected_yes = True
 			elif character in {"q", "Q", "\x03", ""}:
-				return False
+				return None
 	finally:
 		termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_terminal)
 		sys.stdout.write("\033[0m\n")
 		sys.stdout.flush()
+
+
+def _confirm_delete(container_names: list[str]) -> bool:
+	count_label = (
+		f"Delete container {container_names[0]}?"
+		if len(container_names) == 1
+		else f"Delete {len(container_names)} selected containers?"
+	)
+	return _confirm_dialog(count_label, container_names) is True
 
 
 def _apply_picker_action(
@@ -580,6 +592,8 @@ def _apply_picker_action(
 			action_log.append("Container log view closed.")
 		return
 	if action == "recreate":
+		plans = []
+		preparation_failed = False
 		for container in containers:
 			name = _container_name(container)
 			action_log.append(f"Preparing recreation of container {name}.")
@@ -589,11 +603,47 @@ def _apply_picker_action(
 				action_log.append(
 					f"ERROR preparing {name} for recreation: {error}", refresh=True
 				)
+				preparation_failed = True
 				continue
-			if plan is None:
-				action_log.append(f"Recreation cancelled for {name}.")
-				continue
-			action_log.append(f"Recreating container {name} in the background.")
+			plans.append(plan)
+		if preparation_failed or len(plans) != len(containers):
+			action_log.append(
+				"Recreation cancelled; not all selected containers could be prepared.",
+				refresh=True,
+			)
+			return
+		container_names = [plan.name for plan in plans]
+		image_details = [f"{plan.name}: {plan.image}" for plan in plans]
+		pull_decision = _confirm_dialog(
+			"Pull all selected images before recreating?",
+			container_names,
+			image_details,
+		)
+		if pull_decision is None:
+			action_log.append("Recreation cancelled for all selected containers.")
+			return
+		pull_first = pull_decision
+		confirmation_details = [
+			"All listed containers will be replaced.",
+			"Configured mounts will be reused where available.",
+		]
+		auto_remove_names = [plan.name for plan in plans if plan.auto_remove]
+		if auto_remove_names:
+			confirmation_details.append(
+				"Auto-remove is enabled for: "
+				+ ", ".join(auto_remove_names)
+				+ "; anonymous volume data may be removed when stopped."
+			)
+		if _confirm_dialog(
+			"Recreate all selected containers?",
+			container_names,
+			confirmation_details,
+		) is not True:
+			action_log.append("Recreation cancelled for all selected containers.")
+			return
+		for plan in plans:
+			plan.pull_first = pull_first
+			action_log.append(f"Recreating container {plan.name} in the background.")
 			executor.submit(_run_recreate_logged, api, plan, action_log)
 		return
 	start_messages = {
