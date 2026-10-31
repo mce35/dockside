@@ -90,6 +90,13 @@ class DockerAPI:
 	def inspect_container(self, container_id: str) -> dict[str, Any]:
 		return self.request("GET", f"/containers/{quote(container_id, safe='')}/json")
 
+	def container_stats(self, container_id: str) -> dict[str, Any]:
+		return self.request(
+			"GET",
+			f"/containers/{quote(container_id, safe='')}/stats",
+			query={"stream": 0, "one-shot": 1},
+		)
+
 	def inspect_image(self, image: str) -> dict[str, Any]:
 		return self.request("GET", f"/images/{quote(image, safe='')}/json")
 

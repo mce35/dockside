@@ -36,6 +36,7 @@ The `DOCKER_HOST=unix:///path/to/docker.sock` environment variable is also suppo
 - `c`: clear the selection
 - Enter: open the action menu for selected containers
 - `l`: view logs for the active or selected containers
+- `i`: inspect the active or selected containers
 - Ctrl+S: stop
 - `r`: restart a running container or start a stopped container
 - Ctrl+R: recreate

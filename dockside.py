@@ -7,21 +7,24 @@ import argparse
 import os
 import select
 import shutil
+import subprocess
 import sys
 import termios
+import tempfile
 import time
 import tty
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from typing import Any
 
 from container_logs import _decode_container_logs, _show_container_logs, _show_multiple_container_logs
 from container_models import ActionLog, PickerState
 from container_ops import (
     _container_name,
-    _delete_container,
-    _prepare_recreate,
-    _run_background_action,
-    _run_recreate_logged,
+	_delete_container,
+	_prepare_recreate,
+	_run_background_action,
+	_run_recreate_logged,
 )
 from docker_api import DockerAPI, DockerError
 from image_registry import RegistryChecks
@@ -86,6 +89,8 @@ def _read_picker_key() -> str:
 		"A": "all",
 		"c": "clear",
 		"C": "clear",
+		"i": "inspect",
+		"i": "inspect",
 		"l": "logs",
 		"s": "sort_direction",
 		"\x13": "stop",
@@ -187,6 +192,250 @@ def _container_ports_cell(container: dict[str, Any], width: int) -> str:
 	return ""
 
 
+def _format_bytes(value: Any) -> str:
+	try:
+		byte_count = int(value)
+	except (TypeError, ValueError):
+		return "Unavailable"
+	if byte_count < 1024:
+		return f"{byte_count:,} B"
+	amount = float(byte_count)
+	for unit in ("KiB", "MiB", "GiB", "TiB"):
+		amount /= 1024
+		if amount < 1024 or unit == "TiB":
+			return f"{amount:.1f} {unit} ({byte_count:,} B)"
+	return f"{byte_count:,} B"
+
+
+def _format_created_date(created: str | None) -> str:
+	if not created:
+		return "Unavailable"
+	try:
+		created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+	except ValueError:
+		return created
+	if created_at.tzinfo:
+		created_at = created_at.astimezone()
+	return created_at.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+
+
+def _inspection_ports(
+	container: dict[str, Any], inspection: dict[str, Any]
+) -> list[str]:
+	ports = container.get("Ports") or []
+	if ports:
+		formatted = []
+		for port in ports:
+			private_port = port.get("PrivatePort")
+			protocol = port.get("Type", "tcp")
+			if private_port is None:
+				continue
+			if port.get("PublicPort") is None:
+				formatted.append(f"{private_port}/{protocol} (unpublished)")
+			else:
+				host_ip = port.get("IP", "")
+				if ":" in host_ip:
+					host_ip = f"[{host_ip}]"
+				host = f"{host_ip}:" if host_ip else ""
+				formatted.append(
+					f"{host}{port['PublicPort']} -> {private_port}/{protocol}"
+				)
+		return sorted(set(formatted))
+
+	network_settings = inspection.get("NetworkSettings") or {}
+	port_bindings = network_settings.get("Ports") or {}
+	formatted = []
+	for private_port, bindings in sorted(port_bindings.items()):
+		if not bindings:
+			formatted.append(f"{private_port} (unpublished)")
+			continue
+		for binding in bindings:
+			host_ip = binding.get("HostIp", "")
+			if ":" in host_ip:
+				host_ip = f"[{host_ip}]"
+			host = f"{host_ip}:" if host_ip else ""
+			formatted.append(f"{host}{binding.get('HostPort', '?')} -> {private_port}")
+	return formatted
+
+
+def _inspection_stat_lines(stats: dict[str, Any] | None) -> list[str]:
+	if stats is None:
+		return [
+			"CPU: Unavailable",
+			"RAM: Unavailable",
+			"Network bytes (in/out): Unavailable",
+			"I/O bytes (read/write): Unavailable",
+		]
+
+	cpu_stats = stats.get("cpu_stats") or {}
+	previous_cpu_stats = stats.get("precpu_stats") or {}
+	cpu_usage = cpu_stats.get("cpu_usage") or {}
+	previous_cpu_usage = previous_cpu_stats.get("cpu_usage") or {}
+	total_cpu = cpu_usage.get("total_usage")
+	cpu_description = "Unavailable"
+	if total_cpu is not None:
+		cpu_seconds = int(total_cpu) / 1_000_000_000
+		previous_total_cpu = previous_cpu_usage.get("total_usage")
+		system_cpu = cpu_stats.get("system_cpu_usage")
+		previous_system_cpu = previous_cpu_stats.get("system_cpu_usage")
+		online_cpus = cpu_stats.get("online_cpus") or len(
+			cpu_usage.get("percpu_usage") or []
+		)
+		if (
+			previous_total_cpu is not None
+			and system_cpu is not None
+			and previous_system_cpu is not None
+			and online_cpus
+		):
+			cpu_delta = int(total_cpu) - int(previous_total_cpu)
+			system_delta = int(system_cpu) - int(previous_system_cpu)
+			if cpu_delta >= 0 and system_delta > 0:
+				cpu_percent = cpu_delta / system_delta * online_cpus * 100
+				cpu_description = f"{cpu_percent:.1f}% ({cpu_seconds:.2f} CPU s total)"
+			else:
+				cpu_description = f"Unavailable ({cpu_seconds:.2f} CPU s total)"
+		else:
+			cpu_description = f"Unavailable ({cpu_seconds:.2f} CPU s total)"
+
+	memory_stats = stats.get("memory_stats") or {}
+	memory_usage = memory_stats.get("usage")
+	memory_limit = memory_stats.get("limit")
+	if memory_usage is None:
+		memory_description = "Unavailable"
+	else:
+		memory_counters = memory_stats.get("stats") or {}
+		cache = next(
+			(
+				memory_counters[key]
+				for key in ("total_inactive_file", "inactive_file", "cache")
+				if memory_counters.get(key) is not None
+			),
+			0,
+		)
+		used = max(0, int(memory_usage) - int(cache))
+		memory_description = _format_bytes(used)
+		if memory_limit:
+			memory_description += (
+				f" / {_format_bytes(memory_limit)} "
+				f"({used / int(memory_limit) * 100:.1f}%)"
+			)
+
+	network_stats = stats.get("networks")
+	if isinstance(network_stats, dict):
+		received = sum(int(values.get("rx_bytes", 0)) for values in network_stats.values())
+		sent = sum(int(values.get("tx_bytes", 0)) for values in network_stats.values())
+		network_description = f"{_format_bytes(received)} / {_format_bytes(sent)}"
+	else:
+		network_description = "Unavailable"
+
+	block_stats = stats.get("blkio_stats") or {}
+	io_records = block_stats.get("io_service_bytes_recursive")
+	if io_records is None:
+		io_description = "Unavailable"
+	else:
+		io_totals = {"read": 0, "write": 0}
+		for record in io_records:
+			operation = str(record.get("op", "")).casefold()
+			if operation in io_totals:
+				io_totals[operation] += int(record.get("value", 0))
+		io_description = (
+			f"{_format_bytes(io_totals['read'])} / "
+			f"{_format_bytes(io_totals['write'])}"
+		)
+	return [
+		f"CPU: {cpu_description}",
+		f"RAM: {memory_description}",
+		f"Network bytes (in/out): {network_description}",
+		f"I/O bytes (read/write): {io_description}",
+	]
+
+
+def _container_inspection_lines(
+	container: dict[str, Any],
+	inspection: dict[str, Any],
+	stats: dict[str, Any] | None,
+	stats_error: str | None = None,
+) -> list[str]:
+	config = inspection.get("Config") or {}
+	state = inspection.get("State") or {}
+	image_name = config.get("Image") or container.get("Image") or "Unavailable"
+	image_id = inspection.get("Image") or container.get("ImageID") or "Unavailable"
+	state_values = [state.get("Status", "unknown")]
+	if state.get("Running") is not None:
+		state_values.append(f"running={state['Running']}")
+	if state.get("ExitCode") is not None:
+		state_values.append(f"exit code={state['ExitCode']}")
+	if state.get("StartedAt"):
+		state_values.append(f"started={_format_created_date(state['StartedAt'])}")
+
+	lines = [
+		f"Container: {_container_name(container)}",
+		f"Image: {image_name} ({image_id})",
+		f"Created: {_format_created_date(inspection.get('Created'))}",
+		f"State: {'; '.join(state_values)}",
+		"",
+		"Environment:",
+	]
+	environment = config.get("Env") or []
+	lines.extend(f"  {entry}" for entry in environment)
+	if not environment:
+		lines.append("  (none)")
+
+	lines.extend(["", "Volumes / mount points:"])
+	mounts = inspection.get("Mounts") or []
+	for mount in mounts:
+		source = mount.get("Source") or mount.get("Name") or "?"
+		destination = mount.get("Destination") or mount.get("Target") or "?"
+		mode = "rw" if mount.get("RW", True) else "ro"
+		lines.append(
+			f"  {mount.get('Type', 'mount')}: {source} -> {destination} ({mode})"
+		)
+	if not mounts:
+		lines.append("  (none)")
+
+	lines.extend(["", "Ports:"])
+	ports = _inspection_ports(container, inspection)
+	lines.extend(f"  {port}" for port in ports)
+	if not ports:
+		lines.append("  (none)")
+
+	lines.extend(["", "Networks:"])
+	network_settings = inspection.get("NetworkSettings") or {}
+	networks = network_settings.get("Networks") or {}
+	for network_name, network in sorted(networks.items()):
+		lines.append(f"  {network_name}:")
+		lines.append(f"    IPv4: {network.get('IPAddress') or 'Unavailable'}")
+		lines.append(
+			f"    IPv6: {network.get('GlobalIPv6Address') or 'Unavailable'}"
+		)
+		lines.append(f"    MAC: {network.get('MacAddress') or 'Unavailable'}")
+	if not networks:
+		lines.append("  (none)")
+
+	lines.extend(["", "Usage:", *_inspection_stat_lines(stats)])
+	if stats_error:
+		lines.append(f"Statistics unavailable: {stats_error}")
+	return lines
+
+
+def _show_container_inspection(api: DockerAPI, container: dict[str, Any]) -> None:
+	inspection = api.inspect_container(container["Id"])
+	stats_error = None
+	try:
+		stats = api.container_stats(container["Id"])
+	except (DockerError, OSError) as error:
+		stats = None
+		stats_error = str(error)
+	lines = _container_inspection_lines(container, inspection, stats, stats_error)
+	pager = shutil.which("less")
+	if not pager:
+		raise DockerError("The 'less' pager is required to view container inspection.")
+	with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as detail_file:
+		detail_file.write("\n".join(lines) + "\n")
+		detail_file.flush()
+		subprocess.run([pager, "-R", detail_file.name], check=False)
+
+
 def _sort_label(column: str, sort_column: str, sort_ascending: bool) -> str:
 	label = _SORT_LABELS[column]
 	if column == sort_column:
@@ -244,17 +493,17 @@ def _render_container_picker(
 		footer_lines = [
 			registry_progress,
 			"Enter: actions  Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
-			"Left/Right: sort column  s: direction  Up/Down: move  Space: select",
+			"i: inspect  Left/Right: sort column  s: direction  Up/Down: move",
 			"Ctrl+A: all  c: clear  a/q: action log  Ctrl+Q: quit",
 		]
 	elif terminal_rows >= 9:
 		header_lines = ["Select containers"]
 		footer_lines = [
-			f"Left/Right: sort  s: direction  a/q: log  Ctrl+A: all  Ctrl+Q: quit"
+			f"i: inspect  Left/Right: sort  s: direction  Ctrl+A: all  Ctrl+Q: quit"
 		]
 	elif terminal_rows >= 5:
 		header_lines = ["Select containers"]
-		footer_lines = ["Left/Right: sort  s: direction  Ctrl+Q: quit"]
+		footer_lines = ["i: inspect  Left/Right: sort  s: direction  Ctrl+Q: quit"]
 	elif terminal_rows >= 2:
 		header_lines = [column_header]
 		footer_lines = []
@@ -551,7 +800,15 @@ def _select_containers(
 					],
 					None,
 				)
-			elif key in {"logs", "stop", "restart", "recreate", "pull", "delete"}:
+			elif key in {
+				"inspect",
+				"logs",
+				"stop",
+				"restart",
+				"recreate",
+				"pull",
+				"delete",
+			}:
 				target_ids = selected_ids or {containers[active_index]["Id"]}
 				return (
 					[
@@ -660,6 +917,16 @@ def _apply_picker_action(
 		else:
 			action_log.append("Container log view closed.")
 		return
+	if action == "inspect":
+		for container in containers:
+			try:
+				_show_container_inspection(api, container)
+			except (DockerError, OSError) as error:
+				action_log.append(
+					f"ERROR inspecting {_container_name(container)}: {error}",
+					refresh=True,
+				)
+		return
 	if action == "recreate":
 		plans = []
 		preparation_failed = False
@@ -752,13 +1019,15 @@ def _read_action_key(prompt: str) -> str:
 def _container_actions(container: dict[str, Any]) -> str:
 	name = _container_name(container)
 	print(f"\nSelected: {name} ({container.get('Status', 'unknown')})")
-	actions = "s start, Ctrl+S stop, r start/restart, Ctrl+R recreate, p pull, l logs, Ctrl+D delete, b/q back, Ctrl+Q quit"
+	actions = "i inspect, s start, Ctrl+S stop, r start/restart, Ctrl+R recreate, p pull, l logs, Ctrl+D delete, b/q back, Ctrl+Q quit"
 	while True:
 		action = _read_action_key(actions)
 		if action in {"b", "back"}:
 			return "back"
 		if action == "quit":
 			raise KeyboardInterrupt
+		if action == "inspect":
+			return "inspect"
 		if action == "recreate":
 			return "recreate"
 		if action in {"pull", "p"}:
