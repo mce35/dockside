@@ -68,7 +68,24 @@ class DockerAPI:
 			return response_body.decode(errors="replace")
 
 	def list_containers(self) -> list[dict[str, Any]]:
-		return self.request("GET", "/containers/json", query={"all": 1})
+		containers = self.request("GET", "/containers/json", query={"all": 1})
+		for container in containers:
+			image = container.get("Image", "")
+			if not image.startswith("sha256:"):
+				continue
+
+			inspection = self.inspect_container(container["Id"])
+			configured_image = (inspection.get("Config") or {}).get("Image", "")
+			if configured_image and not configured_image.startswith("sha256:"):
+				container["Image"] = configured_image
+				continue
+
+			image_id = container.get("ImageID") or image
+			image_inspection = self.inspect_image(image_id)
+			repository_tags = image_inspection.get("RepoTags") or []
+			if repository_tags and repository_tags[0] != "<none>:<none>":
+				container["Image"] = repository_tags[0]
+		return containers
 
 	def inspect_container(self, container_id: str) -> dict[str, Any]:
 		return self.request("GET", f"/containers/{quote(container_id, safe='')}/json")

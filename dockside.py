@@ -104,6 +104,14 @@ def _status_color(container: dict[str, Any]) -> str:
 	return ANSI_BLUE
 
 
+def _image_label(container: dict[str, Any], freshness: str) -> str:
+	image = container.get("Image", "")
+	if freshness != "OUTDATED":
+		return image
+	current_image = container.get("ImageID") or image
+	return f"Original: {image} (Current: {current_image})"
+
+
 def _render_container_picker(
 	containers: list[dict[str, Any]],
 	active_index: int,
@@ -169,11 +177,12 @@ def _render_container_picker(
 		status = container.get("Status", "")[:20]
 		name = _container_name(container)[:24]
 		freshness = image_freshness.get(container["Id"], "UNKNOWN")
+		image = _image_label(container, freshness)
 		freshness_start = len(prefix) + 20 + 2 + 24 + 2
 		line = (
 			f"{prefix}{status:20}  {name:24}  "
 			f"{freshness:8}  "
-			f"{container.get('Image', '')}"
+			f"{image}"
 		)[:columns]
 		freshness_color = {
 			"CURRENT": ANSI_GREEN,
