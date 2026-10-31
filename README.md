@@ -30,19 +30,19 @@ The `DOCKER_HOST=unix:///path/to/docker.sock` environment variable is also suppo
 ## Picker Controls
 
 - Up/Down: move the active row
+- Left/Right: change the sort column; `s` toggles ascending/descending
 - Space: toggle the active container's selection
-- `A`: select all containers
+- Ctrl+A: select all containers (`A` also works)
 - `c`: clear the selection
 - Enter: open the action menu for selected containers
 - `l`: view logs for the active or selected containers
-- `s`: start
 - Ctrl+S: stop
-- `r`: restart
+- `r`: restart a running container or start a stopped container
 - Ctrl+R: recreate
 - `p`: pull the image without changing the container
 - Ctrl+D: delete after confirmation
 - `a` / `q`: scroll the in-memory action log older / newer
-- `Q`: quit
+- Ctrl+Q: quit
 
 Actions run in the background where possible. Timestamped progress, results, and errors appear below the container list. The list refreshes periodically and after actions complete, while preserving the active row and surviving selections.
 

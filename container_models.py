@@ -11,6 +11,8 @@ class PickerState:
 	active_name: str | None = None
 	active_index: int = 0
 	selected_names: set[str] = field(default_factory=set)
+	sort_column: str = "name"
+	sort_ascending: bool = True
 
 
 @dataclass
