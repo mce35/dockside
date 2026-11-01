@@ -38,11 +38,12 @@ Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH
 
 ## Picker Controls
 
-- Up/Down: move the active row
+- Up/Down: move the active row; Home/End: first/last row
 - Left/Right: change the sort column; `s` toggles ascending/descending
 - Space: toggle the active container's selection
 - Ctrl+A: select all containers (`A` also works)
-- `c`: choose multiple Docker contexts (`Space` toggles; Enter applies)
+- F2: open the Docker image view
+- `c`: choose multiple Docker contexts (Up/Down move; Home/End first/last; Space toggles; Enter applies)
 - `C`: clear the selection
 - `l`: view logs for the active or selected containers
 - `i`: inspect the active or selected containers
@@ -53,6 +54,14 @@ Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH
 - Ctrl+D: delete after confirmation
 - `a` / `q`: scroll the in-memory action log older / newer
 - Ctrl+Q: quit
+
+## Image View
+
+- F1: return to the container view
+- Up/Down: move; Home/End: first/last; Space: toggle selection; Ctrl+A: select all; `C`: clear
+- Left/Right: change sort column; `s`: toggle ascending/descending
+- Ctrl+D: confirm image deletion; removal runs in the background
+- Unused untagged intermediate images are hidden
 
 Actions run in the background where possible. Timestamped progress, results, and errors appear below the container list. The list refreshes periodically and after actions complete, while preserving the active row and surviving selections.
 

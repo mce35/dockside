@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any
 
 from container_logs import _decode_container_logs, _show_container_logs, _show_multiple_container_logs
-from container_models import ActionLog, PickerState
+from container_models import ActionLog, ImagePickerState, PickerState
 from container_ops import (
 	_container_display_name,
     _container_name,
@@ -61,6 +61,15 @@ _SORT_LABELS = {
 	"image": "IMAGE",
 }
 _PORTS_COLUMN_WIDTH = 32
+_IMAGE_SORT_COLUMNS = ("context", "name", "sha", "size", "created", "used")
+_IMAGE_SORT_LABELS = {
+	"context": "CONTEXT",
+	"name": "NAME",
+	"sha": "SHA",
+	"size": "SIZE",
+	"created": "CREATED",
+	"used": "USED BY",
+}
 
 
 def _show_containers(
@@ -84,11 +93,39 @@ def _show_containers(
 def _read_picker_key() -> str:
 	character = sys.stdin.read(1)
 	if character == "\x1b":
-		if sys.stdin.read(1) != "[":
+		prefix = sys.stdin.read(1)
+		if prefix == "O":
+			return {
+				"P": "container_view",
+				"Q": "images",
+				"H": "home",
+				"F": "end",
+			}.get(sys.stdin.read(1), "")
+		if prefix != "[":
 			return ""
-		return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
-			sys.stdin.read(1), ""
+		sequence = sys.stdin.read(1)
+		arrow_key = {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
+			sequence
 		)
+		if arrow_key:
+			return arrow_key
+		if sequence in {"H", "F"}:
+			return {"H": "home", "F": "end"}[sequence]
+		if sequence.isdigit():
+			terminator = sys.stdin.read(1)
+			if terminator.isdigit():
+				sequence += terminator
+				terminator = sys.stdin.read(1)
+			if terminator == "~":
+				return {
+					"1": "home",
+					"4": "end",
+					"7": "home",
+					"8": "end",
+					"11": "container_view",
+					"12": "images",
+				}.get(sequence, "")
+		return ""
 	return {
 		" ": "toggle",
 		"\r": "confirm",
@@ -146,6 +183,33 @@ def _color_action_line(line: str, width: int) -> str:
 	visible_line = line[:width]
 	color = _action_line_color(visible_line)
 	return f"{color}{visible_line}{ANSI_RESET_FG}" if color else visible_line
+
+
+def _common_view_header(
+	daemon_version: str,
+	context_names: str,
+	sockets: str,
+	active_view: str,
+	width: int,
+) -> str:
+	metadata = (
+		f"daemon={daemon_version} | context={context_names} | socket={sockets}"
+	)
+	suffix_width = len(" | F1 containers | F2 images")
+	metadata_width = max(0, width - suffix_width)
+	if len(metadata) > metadata_width:
+		metadata = (
+			metadata[: max(0, metadata_width - 3)] + "..."
+			if metadata_width >= 3
+			else metadata[:metadata_width]
+		)
+	containers_tab = "F1 containers"
+	images_tab = "F2 images"
+	if active_view == "containers":
+		containers_tab = f"\033[7m{containers_tab}\033[0m"
+	else:
+		images_tab = f"\033[7m{images_tab}\033[0m"
+	return f"{metadata} | {containers_tab} | {images_tab}"
 
 
 def _status_color(container: dict[str, Any]) -> str:
@@ -275,6 +339,102 @@ class ContextRegistryChecks:
 	def invalidate(self, containers: list[dict[str, Any]]) -> None:
 		for context_name, group in _group_context_containers(containers).items():
 			self.checks[context_name].invalidate(group)
+
+
+def _image_key(image: dict[str, Any]) -> str:
+	return image.get("_DocksideKey", image.get("Id", ""))
+
+
+def _image_context(image: dict[str, Any]) -> str:
+	return image.get("_DocksideContext", "default")
+
+
+def _image_name(image: dict[str, Any]) -> str:
+	tags = sorted(
+		tag
+		for tag in image.get("RepoTags") or []
+		if tag and tag != "<none>:<none>"
+	)
+	if tags:
+		return ", ".join(tags)
+	digests = sorted(image.get("RepoDigests") or [])
+	return ", ".join(digests) if digests else "<untagged>"
+
+
+def _image_created_value(image: dict[str, Any]) -> float:
+	created = image.get("Created")
+	if isinstance(created, (int, float)):
+		return float(created)
+	if isinstance(created, str):
+		try:
+			return datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+		except ValueError:
+			pass
+	return 0.0
+
+
+def _image_created_label(image: dict[str, Any]) -> str:
+	created = image.get("Created")
+	try:
+		if isinstance(created, (int, float)):
+			return datetime.fromtimestamp(created).astimezone().strftime("%Y-%m-%d")
+		if isinstance(created, str):
+			return _format_created_date(created)[:10]
+	except (OSError, OverflowError, ValueError):
+		pass
+	return "Unavailable"
+
+
+def _list_context_images(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	images = []
+	for target in targets:
+		context_name = target["name"]
+		api = target["api"]
+		containers = api.list_containers()
+		used_by_id: dict[str, set[str]] = {}
+		used_by_tag: dict[str, set[str]] = {}
+		for container in containers:
+			container_display_name = _container_display_name(
+				{**container, "_DocksideContext": context_name}
+			)
+			image_id = container.get("ImageID")
+			if image_id:
+				used_by_id.setdefault(image_id, set()).add(container_display_name)
+			image_reference = container.get("Image")
+			if image_reference:
+				used_by_tag.setdefault(image_reference, set()).add(container_display_name)
+		for listed_image in api.list_images():
+			image = dict(listed_image)
+			image_id = image.get("Id", "")
+			tags = [tag for tag in image.get("RepoTags") or [] if tag != "<none>:<none>"]
+			used_by = set(used_by_id.get(image_id, set()))
+			for tag in tags:
+				used_by.update(used_by_tag.get(tag, set()))
+			image["_DocksideContext"] = context_name
+			image["_DocksideKey"] = f"{context_name}\0{image_id}"
+			image["_DocksideUsed"] = sorted(used_by)
+			if _image_name(image) == "<untagged>" and not used_by:
+				continue
+			images.append(image)
+	return images
+
+
+def _run_image_delete(
+	api: DockerAPI, image: dict[str, Any], action_log: ActionLog
+) -> None:
+	context_name = _image_context(image)
+	image_name = _image_name(image)
+	try:
+		api.remove_image(image["Id"])
+	except (DockerError, OSError) as error:
+		action_log.append(
+			f"ERROR deleting image {context_name}/{image_name}: {error}",
+			refresh=True,
+		)
+	else:
+		action_log.append(
+			f"Deleted image {context_name}/{image_name}.", refresh=True
+		)
 
 
 def _format_bytes(value: Any) -> str:
@@ -571,8 +731,11 @@ def _render_container_picker(
 	terminal_size = shutil.get_terminal_size((80, 24))
 	columns = max(1, terminal_size.columns - 1)
 	terminal_rows = max(1, terminal_size.lines)
+	selection_label = f"{len(selected_ids)}✓"
+	selection_width = max(4, len(selection_label))
+	number_width = max(2, len(str(len(containers))))
 	column_header = (
-		f"{'':3}  {' ':3}  "
+		f"{'':{number_width + 2}}  {selection_label:<{selection_width}}  "
 		f"{_sort_label('id', sort_column, sort_ascending):12}  "
 		f"{_sort_label('status', sort_column, sort_ascending):8}  "
 		f"{_sort_label('name', sort_column, sort_ascending):16}  "
@@ -583,21 +746,21 @@ def _render_container_picker(
 		f"{_sort_label('image', sort_column, sort_ascending)}"
 	)
 	if terminal_rows >= 14:
-		header_lines = ["Select containers", column_header]
+		header_lines = ["", column_header]
 		footer_lines = [
 			registry_progress,
 			"Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
-			"i: inspect  Left/Right: sort column  s: direction  Up/Down: move",
+			"F2: images  i: inspect  Up/Down move  Home/End first/last  Left/Right sort  s direction",
 			"c: contexts  Ctrl+A: all  C: clear  a/q: action log  Ctrl+Q: quit",
 		]
 	elif terminal_rows >= 9:
-		header_lines = ["Select containers"]
+		header_lines = ["", column_header]
 		footer_lines = [
-			f"c: contexts  i: inspect  sort: Left/Right  Ctrl+A: all  Ctrl+Q: quit"
+			f"F2: images  i: inspect  Home/End: first/last  sort: Left/Right"
 		]
 	elif terminal_rows >= 5:
-		header_lines = ["Select containers"]
-		footer_lines = ["c: contexts  i: inspect  Left/Right: sort  Ctrl+Q: quit"]
+		header_lines = ["", column_header]
+		footer_lines = ["F2: images  Home/End: first/last  Left/Right: sort"]
 	elif terminal_rows >= 2:
 		header_lines = [column_header]
 		footer_lines = []
@@ -607,12 +770,16 @@ def _render_container_picker(
 	has_action_pane = terminal_rows >= 5
 	show_separators = has_action_pane and terminal_rows >= 7
 	separator_count = 2 if show_separators else 0
+	common_header_rows = int(
+		bool(context_name or docker_endpoint or daemon_version)
+	)
 	action_line_count = (
 		min(
 			8,
 			max(
 				0,
 				terminal_rows
+				- common_header_rows
 				- len(header_lines)
 				- len(footer_lines)
 				- 2
@@ -625,6 +792,7 @@ def _render_container_picker(
 	visible_count = max(
 		1,
 		terminal_rows
+		- common_header_rows
 		- len(header_lines)
 		- len(footer_lines)
 		- (action_line_count + 1 + separator_count if has_action_pane else 0),
@@ -633,52 +801,37 @@ def _render_container_picker(
 		max_start = max(0, len(containers) - visible_count)
 		start_index = min(max(0, active_index - visible_count // 2), max_start)
 		end_index = min(len(containers), start_index + visible_count)
-		title = (
-			f"Select containers ({len(selected_ids)} selected, "
-			f"showing {start_index + 1}-{end_index} of {len(containers)})"
-		)
+		title = f"Docker containers (showing {start_index + 1}-{end_index} of {len(containers)})"
 	else:
 		start_index = 0
 		end_index = 0
-		title = "No containers currently found."
-	if context_name or docker_endpoint or daemon_version:
-		title_parts = [f"{len(selected_ids)} selected"]
-		if terminal_rows < 14:
-			title_parts.append(
-				f"sort={_sort_label(sort_column, sort_column, sort_ascending)}"
-			)
-		if context_name:
-			title_parts.append(f"context={context_name}")
-		if daemon_version:
-			title_parts.append(f"daemon={daemon_version}")
-		if docker_endpoint:
-			socket_value = (
-				docker_endpoint[len("unix://") :]
-				if docker_endpoint.startswith("unix://")
-				else docker_endpoint
-			)
-			socket_prefix = f"{' | '.join(title_parts)} | socket="
-			available = max(0, columns - len(socket_prefix))
-			if len(socket_value) > available:
-				socket_value = (
-					socket_value[: available - 3] + "..."
-					if available >= 3
-					else socket_value[:available]
-				)
-			title = socket_prefix + socket_value
-		else:
-			title = " | ".join(title_parts)
-	else:
-		if terminal_rows < 14:
-			title += f"  {_sort_label(sort_column, sort_column, sort_ascending)}"
-	if header_lines:
+		title = "Docker containers (showing 0 of 0)"
+	if terminal_rows >= 5:
 		header_lines[0] = title
-	lines = [line[:columns] for line in header_lines]
+	common_header = (
+		_common_view_header(
+			daemon_version or "unknown",
+			context_name or "unknown",
+			docker_endpoint or "unknown",
+			"containers",
+			columns,
+		)
+		if context_name or docker_endpoint or daemon_version
+		else None
+	)
+	lines = ([common_header] if common_header else []) + [
+		line[:columns] for line in header_lines
+	]
 	for index in range(start_index, end_index):
 		container = containers[index]
 		container_key = _container_key(container)
-		marker = "[x]" if container_key in selected_ids else "[ ]"
-		prefix = f"{index + 1:>3}  {marker:3}  {container['Id'][:12]:12}  "
+		marker = "[✓]" if container_key in selected_ids else "[ ]"
+		active_marker = ">" if index == active_index else " "
+		prefix = (
+			f"{active_marker} {index + 1:<{number_width}}  "
+			f"{marker:<{selection_width}}  "
+			f"{container['Id'][:12]:12}  "
+		)
 		status = container.get("Status", "")[:8]
 		name = _container_name(container)[:16]
 		context = _container_context(container)[:12]
@@ -730,6 +883,341 @@ def _render_container_picker(
 	sys.stdout.write("\033[2J\033[H")
 	sys.stdout.write("\r\n".join(lines))
 	sys.stdout.flush()
+
+
+def _image_sort_value(image: dict[str, Any], column: str) -> Any:
+	if column == "context":
+		return _image_context(image).casefold()
+	if column == "name":
+		return _image_name(image).casefold()
+	if column == "sha":
+		return image.get("Id", "").casefold()
+	if column == "size":
+		return int(image.get("Size") or 0)
+	if column == "created":
+		return _image_created_value(image)
+	return ", ".join(image.get("_DocksideUsed") or []).casefold()
+
+
+def _sort_images(images: list[dict[str, Any]], state: ImagePickerState) -> None:
+	images.sort(key=lambda image: _image_name(image).casefold())
+	images.sort(
+		key=lambda image: _image_sort_value(image, state.sort_column),
+		reverse=not state.sort_ascending,
+	)
+
+
+def _image_column_label(column: str, state: ImagePickerState, width: int) -> str:
+	label = _IMAGE_SORT_LABELS[column]
+	if column == state.sort_column:
+		label += " " + ("↑" if state.sort_ascending else "↓")
+	if column == "size":
+		return label[:width].rjust(width)
+	return label[:width].ljust(width)
+
+
+def _truncate_cell(value: str, width: int, *, align_right: bool = False) -> str:
+	if len(value) <= width:
+		return value.rjust(width) if align_right else value.ljust(width)
+	if width <= 3:
+		return value[:width]
+	truncated = value[: width - 3] + "..."
+	return truncated.rjust(width) if align_right else truncated
+
+
+def _format_image_size(value: Any) -> str:
+	return _format_bytes(value).split(" (", 1)[0]
+
+
+def _render_image_picker(
+	images: list[dict[str, Any]],
+	active_index: int,
+	selected_keys: set[str],
+	state: ImagePickerState,
+	action_log: ActionLog,
+	context_names: str,
+	sockets: str,
+	daemon_version: str,
+) -> None:
+	terminal_size = shutil.get_terminal_size((80, 24))
+	columns = max(1, terminal_size.columns - 1)
+	rows = max(1, terminal_size.lines)
+	context_width = min(12, max(6, columns // 12))
+	name_width = min(24, max(12, columns // 6))
+	sha_width = min(20, max(12, columns // 8))
+	size_width = 10
+	created_width = 10
+	number_width = max(2, len(str(len(images))))
+	used_width = min(
+		48,
+		max(
+			6,
+			columns
+			- 5
+			- 10
+			- context_width
+			- name_width
+			- sha_width
+			- size_width
+			- created_width,
+		),
+	)
+	selection_label = f"{len(selected_keys)}✓"
+	selection_width = max(4, len(selection_label))
+	number_width = max(2, len(str(len(images))))
+	column_header = (
+		f"{'':{number_width + 2}}  {selection_label:<{selection_width}}  "
+		f"{_image_column_label('context', state, context_width)}  "
+		f"{_image_column_label('name', state, name_width)}  "
+		f"{_image_column_label('sha', state, sha_width)}  "
+		f"{_image_column_label('size', state, size_width)}  "
+		f"{_image_column_label('created', state, created_width)}  "
+		f"{_image_column_label('used', state, used_width)}"
+	)
+	has_action_pane = rows >= 7
+	footer_lines = (
+		[
+			"Up/Down move  Space select  Ctrl+A all  C clear  Left/Right sort  s direction",
+			"a/q action log  Ctrl+D delete  F1 containers  F2 images  Ctrl+Q quit",
+		]
+		if rows >= 9
+		else ["a/q action log  Ctrl+D delete  F1 containers  F2 images  Ctrl+Q quit"]
+		if rows >= 5
+		else []
+	)
+	separator_count = 1 if has_action_pane else 0
+	max_action_lines = (
+		max(
+			0,
+			min(
+				6,
+				rows
+				- 3
+				- len(footer_lines)
+				- separator_count
+				- 1
+				- 1,
+			),
+		)
+		if has_action_pane
+		else 0
+	)
+	action_lines, action_start, action_total = action_log.visible(max_action_lines)
+	action_display_count = max(1, len(action_lines)) if has_action_pane else 0
+	title = "Docker images (showing 0 of 0)"
+	if images:
+		active_index = max(0, min(active_index, len(images) - 1))
+		visible_count = max(
+			1,
+			rows
+			- 3
+			- len(footer_lines)
+			- separator_count
+			- (1 + action_display_count if has_action_pane else 0),
+		)
+		start = min(max(0, active_index - visible_count // 2), max(0, len(images) - visible_count))
+		end = min(len(images), start + visible_count)
+		title = f"Docker images (showing {start + 1}-{end} of {len(images)})"
+	else:
+		start = 0
+		end = 0
+	common_header = _common_view_header(
+		daemon_version, context_names, sockets, "images", columns
+	)
+	lines = [common_header, title[:columns], column_header[:columns]]
+	for index in range(start, end):
+		image = images[index]
+		key = _image_key(image)
+		marker = "[✓]" if key in selected_keys else "[ ]"
+		active_marker = ">" if index == active_index else " "
+		used = ", ".join(image.get("_DocksideUsed") or []) or "(none)"
+		fields = [
+			_truncate_cell(_image_context(image), context_width),
+			_truncate_cell(_image_name(image), name_width),
+			_truncate_cell(image.get("Id", "Unavailable"), sha_width),
+			_truncate_cell(
+				_format_image_size(image.get("Size")), size_width, align_right=True
+			),
+			_truncate_cell(_image_created_label(image), created_width),
+			_truncate_cell(used, used_width),
+		]
+		line = (
+			f"{active_marker} {index + 1:<{number_width}}  "
+			f"{marker:<{selection_width}}  "
+			+ "  ".join(fields)
+		)
+		if key in selected_keys:
+			line = f"{ANSI_LIGHT_GREEN_BG}{line}{ANSI_RESET_BG}"
+			if index == active_index:
+				line = f"\033[4m{line}\033[24m"
+		elif index == active_index:
+			line = f"\033[7m{line[:columns]}\033[0m"
+		lines.append(line[:columns])
+	if has_action_pane:
+		lines.append("-" * columns)
+		if action_total:
+			if action_lines:
+				action_label = (
+					f"Actions ({action_start + 1}-{action_start + len(action_lines)} "
+					f"of {action_total}; a older, q newer)"
+				)
+			else:
+				action_label = f"Actions ({action_total} entries; a older, q newer)"
+		else:
+			action_label = "Actions (0 entries; a older, q newer)"
+		lines.append(action_label[:columns])
+		if action_total:
+			lines.extend(_color_action_line(line, columns) for line in action_lines)
+		else:
+			lines.append("No actions yet."[:columns])
+	lines.extend(line[:columns] for line in footer_lines)
+	sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines))
+	sys.stdout.flush()
+
+
+def _select_images(
+	targets: list[dict[str, Any]],
+	state: ImagePickerState,
+	action_log: ActionLog,
+	executor: ThreadPoolExecutor,
+) -> str:
+	images = _list_context_images(targets)
+	state.selected_keys.intersection_update(_image_key(image) for image in images)
+	if state.active_key not in {_image_key(image) for image in images}:
+		state.active_key = _image_key(images[0]) if images else None
+	pending_deletes: dict[str, Future[None]] = {}
+	file_descriptor = sys.stdin.fileno()
+	original_terminal = termios.tcgetattr(file_descriptor)
+	try:
+		tty.setraw(file_descriptor)
+		while True:
+			completed_deletes = [
+				image_key
+				for image_key, future in pending_deletes.items()
+				if future.done()
+			]
+			if completed_deletes:
+				for image_key in completed_deletes:
+					pending_deletes.pop(image_key, None)
+				images = _list_context_images(targets)
+				state.selected_keys.intersection_update(
+					_image_key(image) for image in images
+				)
+				if state.active_key not in {_image_key(image) for image in images}:
+					state.active_key = _image_key(images[0]) if images else None
+			_sort_images(images, state)
+			active_index = next(
+				(
+					index
+					for index, image in enumerate(images)
+					if _image_key(image) == state.active_key
+				),
+				0,
+			)
+			_render_image_picker(
+				images,
+				active_index,
+				state.selected_keys,
+				state,
+				action_log,
+				",".join(target["name"] for target in targets),
+				",".join(target["endpoint"] for target in targets),
+				",".join(
+					dict.fromkeys(str(target["api"].daemon_version) for target in targets)
+				),
+			)
+			readable, _, _ = select.select([file_descriptor], [], [], 0.2)
+			if not readable:
+				continue
+			key = _read_picker_key()
+			if key == "container_view":
+				return "containers"
+			if key == "quit":
+				return "quit"
+			if key == "up":
+				active_index = max(0, active_index - 1)
+				if images:
+					state.active_key = _image_key(images[active_index])
+			elif key == "home":
+				active_index = 0
+				if images:
+					state.active_key = _image_key(images[active_index])
+			elif key == "down":
+				active_index = min(max(0, len(images) - 1), active_index + 1)
+				if images:
+					state.active_key = _image_key(images[active_index])
+			elif key == "end":
+				active_index = max(0, len(images) - 1)
+				if images:
+					state.active_key = _image_key(images[active_index])
+			elif key in {"left", "right"}:
+				column_index = _IMAGE_SORT_COLUMNS.index(state.sort_column)
+				step = -1 if key == "left" else 1
+				state.sort_column = _IMAGE_SORT_COLUMNS[
+					(column_index + step) % len(_IMAGE_SORT_COLUMNS)
+				]
+			elif key == "sort_direction":
+				state.sort_ascending = not state.sort_ascending
+			elif key == "action_up":
+				action_log.scroll(1)
+			elif key == "action_down":
+				action_log.scroll(-1)
+			elif key == "toggle" and images:
+				image_key = _image_key(images[active_index])
+				if image_key in state.selected_keys:
+					state.selected_keys.remove(image_key)
+				else:
+					state.selected_keys.add(image_key)
+			elif key == "all":
+				state.selected_keys = {_image_key(image) for image in images}
+			elif key == "clear":
+				state.selected_keys.clear()
+			elif key == "delete" and images:
+				selected_keys = state.selected_keys or {
+					_image_key(images[active_index])
+				}
+				selected_images = [
+					image
+					for image in images
+					if _image_key(image) in selected_keys
+					and _image_key(image) not in pending_deletes
+				]
+				if not selected_images:
+					action_log.append("Selected images are already being deleted.")
+					continue
+				names = [
+					f"{_image_context(image)}/{_image_name(image)}"
+					for image in selected_images
+				]
+				prompt = (
+					f"Delete image {names[0]}?"
+					if len(names) == 1
+					else f"Delete {len(names)} selected images?"
+				)
+				if _confirm_dialog(prompt, names, list_label="Images") is not True:
+					action_log.append("Image deletion cancelled.")
+					continue
+				for image in selected_images:
+					context_name = _image_context(image)
+					image_name = _image_name(image)
+					action_log.append(
+						f"Deleting image {context_name}/{image_name} in the background."
+					)
+					api = next(
+						target["api"]
+						for target in targets
+						if target["name"] == context_name
+					)
+					pending_deletes[_image_key(image)] = executor.submit(
+						_run_image_delete, api, image, action_log
+					)
+					state.selected_keys.discard(_image_key(image))
+			elif images:
+				state.active_key = _image_key(images[active_index])
+	finally:
+		termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_terminal)
+		sys.stdout.write("\033[0m\n")
+		sys.stdout.flush()
 
 
 def _merge_container_refresh(
@@ -893,11 +1381,17 @@ def _select_containers(
 			if not containers:
 				if key == "quit":
 					return None
+				if key == "images":
+					return [], "images"
 				if key == "contexts":
 					return [], "contexts"
 				continue
 			if key == "up":
 				active_index = max(0, active_index - 1)
+			elif key == "home":
+				active_index = 0
+			elif key == "end":
+				active_index = max(0, len(containers) - 1)
 			elif key == "down":
 				active_index = min(len(containers) - 1, active_index + 1)
 			elif key in {"left", "right"}:
@@ -924,6 +1418,7 @@ def _select_containers(
 				selected_ids.clear()
 			elif key in {
 				"contexts",
+				"images",
 				"inspect",
 				"logs",
 				"stop",
@@ -955,6 +1450,7 @@ def _confirm_dialog(
 	prompt: str,
 	container_names: list[str],
 	details: list[str] | None = None,
+	list_label: str = "Containers",
 ) -> bool | None:
 	selected_yes = True
 	file_descriptor = sys.stdin.fileno()
@@ -974,7 +1470,7 @@ def _confirm_dialog(
 			if details:
 				dialog_lines.extend(line[:columns] for line in details)
 				dialog_lines.append("")
-			dialog_lines.extend(["Containers:", *container_lines, ""])
+			dialog_lines.extend([f"{list_label}:", *container_lines, ""])
 			dialog_lines.extend(
 				[
 					f"{yes_label}    {no_label}",
@@ -1215,8 +1711,12 @@ def _pick_docker_context(
 			key = _read_picker_key()
 			if key == "up":
 				selected_index = max(0, selected_index - 1)
+			elif key == "home":
+				selected_index = 0
 			elif key == "down":
 				selected_index = min(len(contexts) - 1, selected_index + 1)
+			elif key == "end":
+				selected_index = len(contexts) - 1
 			elif key == "toggle":
 				if selected_index in selected_contexts:
 					selected_contexts.remove(selected_index)
@@ -1355,6 +1855,7 @@ def main() -> int:
 		with ThreadPoolExecutor(max_workers=8) as executor:
 			registry_checks = ContextRegistryChecks(targets, executor)
 			picker_state = PickerState()
+			image_picker_state = ImagePickerState()
 			action_log = ActionLog()
 			while True:
 				last_action_refresh = action_log.completion_generation()
@@ -1378,6 +1879,13 @@ def main() -> int:
 				if selection is None:
 					return 0
 				selected_containers, shortcut_action = selection
+				if shortcut_action == "images":
+					view = _select_images(
+						targets, image_picker_state, action_log, executor
+					)
+					if view == "quit":
+						return 0
+					continue
 				if shortcut_action == "contexts":
 					try:
 						contexts = _docker_contexts()

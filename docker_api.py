@@ -202,6 +202,16 @@ class DockerAPI:
 	def inspect_image(self, image: str) -> dict[str, Any]:
 		return self.request("GET", f"/images/{quote(image, safe='')}/json")
 
+	def list_images(self) -> list[dict[str, Any]]:
+		return self.request("GET", "/images/json", query={"all": 1})
+
+	def remove_image(self, image_id: str) -> None:
+		self.request(
+			"DELETE",
+			f"/images/{quote(image_id, safe='')}",
+			query={"force": 0, "noprune": 0},
+		)
+
 	def container_logs(self, container_id: str) -> bytes:
 		return self.request(
 			"GET",
