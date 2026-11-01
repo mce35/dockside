@@ -39,11 +39,21 @@ from terminal_colors import (
     ANSI_YELLOW,
 )
 
-_SORT_COLUMNS = ("id", "status", "name", "created", "ports", "freshness", "image")
+_SORT_COLUMNS = (
+	"id",
+	"status",
+	"name",
+	"context",
+	"created",
+	"ports",
+	"freshness",
+	"image",
+)
 _SORT_LABELS = {
 	"id": "CONTAINER ID",
 	"status": "STATUS",
 	"name": "NAME",
+	"context": "CONTEXT",
 	"created": "CREATED",
 	"ports": "PORTS",
 	"freshness": "LATEST?",
@@ -204,6 +214,66 @@ def _container_ports_cell(container: dict[str, Any], width: int) -> str:
 	if labels:
 		return labels[0][: max(0, width - 3)] + "..."[:width]
 	return ""
+
+
+def _container_context(container: dict[str, Any]) -> str:
+	return container.get("_DocksideContext", "default")
+
+
+def _container_key(container: dict[str, Any]) -> str:
+	return container.get("_DocksideKey", container["Id"])
+
+
+def _group_context_containers(
+	containers: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+	groups: dict[str, list[dict[str, Any]]] = {}
+	for container in containers:
+		groups.setdefault(_container_context(container), []).append(container)
+	return groups
+
+
+class ContextRegistryChecks:
+	def __init__(self, targets: list[dict[str, Any]], executor: ThreadPoolExecutor) -> None:
+		self.targets = targets
+		self.executor = executor
+		self.api = self
+		self.checks = {
+			target["name"]: RegistryChecks(target["api"], executor, {})
+			for target in targets
+		}
+
+	def list_containers(self) -> list[dict[str, Any]]:
+		containers = []
+		for target in self.targets:
+			for listed_container in target["api"].list_containers():
+				container = dict(listed_container)
+				container["_DocksideContext"] = target["name"]
+				container["_DocksideKey"] = f"{target['name']}\0{container['Id']}"
+				containers.append(container)
+		return containers
+
+	def update(self, containers: list[dict[str, Any]]) -> None:
+		for context_name, group in _group_context_containers(containers).items():
+			self.checks[context_name].update(group)
+
+	def snapshot(
+		self, containers: list[dict[str, Any]]
+	) -> tuple[dict[str, str], str]:
+		freshness: dict[str, str] = {}
+		progress: list[str] = []
+		for context_name, group in _group_context_containers(containers).items():
+			context_freshness, context_progress = self.checks[context_name].snapshot(group)
+			progress.append(f"{context_name}: {context_progress}")
+			for container in group:
+				freshness[_container_key(container)] = context_freshness.get(
+					container["Id"], "UNKNOWN"
+				)
+		return freshness, "; ".join(progress)
+
+	def invalidate(self, containers: list[dict[str, Any]]) -> None:
+		for context_name, group in _group_context_containers(containers).items():
+			self.checks[context_name].invalidate(group)
 
 
 def _format_bytes(value: Any) -> str:
@@ -468,12 +538,14 @@ def _sort_containers(
 			return container.get("Id", "").casefold()
 		if sort_column == "status":
 			return container.get("Status", "").casefold()
+		if sort_column == "context":
+			return _container_context(container).casefold()
 		if sort_column == "created":
 			return _container_created_label(container).casefold()
 		if sort_column == "ports":
 			return _container_ports(container).casefold()
 		if sort_column == "freshness":
-			return image_freshness.get(container.get("Id", ""), "UNKNOWN").casefold()
+			return image_freshness.get(_container_key(container), "UNKNOWN").casefold()
 		if sort_column == "image":
 			return container.get("Image", "").casefold()
 		return _container_name(container).casefold()
@@ -503,6 +575,7 @@ def _render_container_picker(
 		f"{_sort_label('id', sort_column, sort_ascending):12}  "
 		f"{_sort_label('status', sort_column, sort_ascending):8}  "
 		f"{_sort_label('name', sort_column, sort_ascending):16}  "
+		f"{_sort_label('context', sort_column, sort_ascending):12}  "
 		f"{_sort_label('created', sort_column, sort_ascending):12}  "
 		f"{_sort_label('ports', sort_column, sort_ascending):{_PORTS_COLUMN_WIDTH}}  "
 		f"{_sort_label('freshness', sort_column, sort_ascending):8}  "
@@ -602,19 +675,21 @@ def _render_container_picker(
 	lines = [line[:columns] for line in header_lines]
 	for index in range(start_index, end_index):
 		container = containers[index]
-		marker = "[x]" if container["Id"] in selected_ids else "[ ]"
+		container_key = _container_key(container)
+		marker = "[x]" if container_key in selected_ids else "[ ]"
 		prefix = f"{index + 1:>3}  {marker:3}  {container['Id'][:12]:12}  "
 		status = container.get("Status", "")[:8]
 		name = _container_name(container)[:16]
+		context = _container_context(container)[:12]
 		created = _container_created_label(container)
 		ports = _container_ports_cell(container, _PORTS_COLUMN_WIDTH)
-		freshness = image_freshness.get(container["Id"], "UNKNOWN")
+		freshness = image_freshness.get(container_key, "UNKNOWN")
 		image = _image_label(container, freshness)
 		freshness_start = (
-			len(prefix) + 8 + 2 + 16 + 2 + 12 + 2 + _PORTS_COLUMN_WIDTH + 2
+			len(prefix) + 8 + 2 + 16 + 2 + 12 + 2 + 12 + 2 + _PORTS_COLUMN_WIDTH + 2
 		)
 		line = (
-			f"{prefix}{status:8}  {name:16}  {created:12}  "
+			f"{prefix}{status:8}  {name:16}  {context:12}  {created:12}  "
 			f"{ports:{_PORTS_COLUMN_WIDTH}}  "
 			f"{freshness:8}  "
 			f"{image}"
@@ -626,7 +701,7 @@ def _render_container_picker(
 		}.get(freshness, ANSI_BLUE)
 		line = _paint_span(line, freshness_start, 8, freshness_color)
 		line = _paint_span(line, len(prefix), 8, _status_color(container))
-		if container["Id"] in selected_ids:
+		if container_key in selected_ids:
 			line = f"{ANSI_LIGHT_GREEN_BG}{line.ljust(columns)}{ANSI_RESET_BG}"
 			if index == active_index:
 				line = f"\033[4m{line}\033[24m"
@@ -663,27 +738,28 @@ def _merge_container_refresh(
 	selected_ids: set[str],
 ) -> tuple[list[dict[str, Any]], int, set[str]]:
 	active_name = (
-		_container_name(current[active_index])
+		_container_key(current[active_index])
 		if current and 0 <= active_index < len(current)
 		else None
 	)
 	selected_names = {
-		_container_name(container)
+		_container_key(container)
 		for container in current
-		if container["Id"] in selected_ids
+		if _container_key(container) in selected_ids
 	}
-	refreshed.sort(key=lambda item: _container_name(item).casefold())
-	refreshed_names = {_container_name(container) for container in refreshed}
+	refreshed.sort(key=lambda item: _container_key(item))
 	selected_ids = {
-		container["Id"]
+		_container_key(container)
 		for container in refreshed
-		if _container_name(container) in selected_names
+		if _container_key(container) in selected_names
 	}
-	if active_name in refreshed_names:
+	if active_name is not None and any(
+		_container_key(container) == active_name for container in refreshed
+	):
 		active_index = next(
 			index
 			for index, container in enumerate(refreshed)
-			if _container_name(container) == active_name
+			if _container_key(container) == active_name
 		)
 	else:
 		active_index = min(active_index, max(0, len(refreshed) - 1))
@@ -693,8 +769,8 @@ def _merge_container_refresh(
 def _restore_picker_state(
 	containers: list[dict[str, Any]], state: PickerState
 ) -> tuple[int, set[str]]:
-	names = {_container_name(container) for container in containers}
-	state.selected_names.intersection_update(names)
+	keys = {_container_key(container) for container in containers}
+	state.selected_names.intersection_update(keys)
 	if not containers:
 		state.active_name = None
 		state.active_index = 0
@@ -703,23 +779,23 @@ def _restore_picker_state(
 		(
 			index
 			for index, container in enumerate(containers)
-			if _container_name(container) == state.active_name
+			if _container_key(container) == state.active_name
 		),
 		min(state.active_index, len(containers) - 1),
 	)
 	state.active_index = active_index
-	state.active_name = _container_name(containers[active_index])
+	state.active_name = _container_key(containers[active_index])
 	selected_ids = {
-		container["Id"]
+		_container_key(container)
 		for container in containers
-		if _container_name(container) in state.selected_names
+		if _container_key(container) in state.selected_names
 	}
 	return active_index, selected_ids
 
 
 def _select_containers(
 	containers: list[dict[str, Any]],
-	registry_checks: RegistryChecks,
+	registry_checks: ContextRegistryChecks,
 	picker_state: PickerState,
 	action_log: ActionLog,
 	last_action_refresh: int,
@@ -770,7 +846,7 @@ def _select_containers(
 			registry_checks.update(containers)
 			image_freshness, registry_progress = registry_checks.snapshot(containers)
 			active_container_id = (
-				containers[active_index]["Id"] if containers else None
+				_container_key(containers[active_index]) if containers else None
 			)
 			_sort_containers(
 				containers,
@@ -782,16 +858,16 @@ def _select_containers(
 				active_index = next(
 					index
 					for index, container in enumerate(containers)
-					if container["Id"] == active_container_id
+					if _container_key(container) == active_container_id
 				)
 			picker_state.active_index = active_index
 			picker_state.active_name = (
-				_container_name(containers[active_index]) if containers else None
+				_container_key(containers[active_index]) if containers else None
 			)
 			picker_state.selected_names = {
-				_container_name(container)
+				_container_key(container)
 				for container in containers
-				if container["Id"] in selected_ids
+				if _container_key(container) in selected_ids
 			}
 			if refresh_future is not None and not refresh_future.done():
 				registry_progress += "; container refresh in progress"
@@ -832,13 +908,13 @@ def _select_containers(
 			elif key == "sort_direction":
 				picker_state.sort_ascending = not picker_state.sort_ascending
 			elif key == "toggle":
-				container_id = containers[active_index]["Id"]
+				container_id = _container_key(containers[active_index])
 				if container_id in selected_ids:
 					selected_ids.remove(container_id)
 				else:
 					selected_ids.add(container_id)
 			elif key == "all":
-				selected_ids = {container["Id"] for container in containers}
+				selected_ids = {_container_key(container) for container in containers}
 			elif key == "action_up":
 				action_log.scroll(1)
 			elif key == "action_down":
@@ -846,12 +922,14 @@ def _select_containers(
 			elif key == "clear":
 				selected_ids.clear()
 			elif key == "confirm":
-				target_ids = selected_ids or {containers[active_index]["Id"]}
+				target_ids = selected_ids or {
+					_container_key(containers[active_index])
+				}
 				return (
 					[
 						container
 						for container in containers
-						if container["Id"] in target_ids
+						if _container_key(container) in target_ids
 					],
 					None,
 				)
@@ -865,12 +943,14 @@ def _select_containers(
 				"pull",
 				"delete",
 			}:
-				target_ids = selected_ids or {containers[active_index]["Id"]}
+				target_ids = selected_ids or {
+					_container_key(containers[active_index])
+				}
 				return (
 					[
 						container
 						for container in containers
-						if container["Id"] in target_ids
+						if _container_key(container) in target_ids
 					],
 					key,
 				)
@@ -949,6 +1029,75 @@ def _confirm_delete(container_names: list[str]) -> bool:
 	return _confirm_dialog(count_label, container_names) is True
 
 
+def _recreate_context_batch(
+	api_containers: list[tuple[DockerAPI, dict[str, Any]]],
+	executor: ThreadPoolExecutor,
+	action_log: ActionLog,
+) -> None:
+	qualify_names = len({_container_context(container) for _, container in api_containers}) > 1
+	plans: list[tuple[DockerAPI, Any, str]] = []
+	preparation_failed = False
+	for api, container in api_containers:
+		name = _container_name(container)
+		display_name = (
+			f"{_container_context(container)}/{name}" if qualify_names else name
+		)
+		action_log.append(f"Preparing recreation of container {display_name}.")
+		try:
+			plan = _prepare_recreate(api, container["Id"])
+		except (DockerError, OSError) as error:
+			action_log.append(
+				f"ERROR preparing {display_name} for recreation: {error}", refresh=True
+			)
+			preparation_failed = True
+			continue
+		plans.append((api, plan, display_name))
+	if preparation_failed or len(plans) != len(api_containers):
+		action_log.append(
+			"Recreation cancelled; not all selected containers could be prepared.",
+			refresh=True,
+		)
+		return
+
+	container_names = [display_name for _, _, display_name in plans]
+	image_details = [
+		f"{display_name}: {plan.image}"
+		for _, plan, display_name in plans
+	]
+	pull_decision = _confirm_dialog(
+		"Pull all selected images before recreating?",
+		container_names,
+		image_details,
+	)
+	if pull_decision is None:
+		action_log.append("Recreation cancelled for all selected containers.")
+		return
+	confirmation_details = [
+		"All listed containers will be replaced.",
+		"Configured mounts will be reused where available.",
+	]
+	auto_remove_names = [
+		display_name
+		for _, plan, display_name in plans
+		if plan.auto_remove
+	]
+	if auto_remove_names:
+		confirmation_details.append(
+			"Auto-remove is enabled for: "
+			+ ", ".join(auto_remove_names)
+			+ "; anonymous volume data may be removed when stopped."
+		)
+	if _confirm_dialog(
+		"Recreate all selected containers?", container_names, confirmation_details
+	) is not True:
+		action_log.append("Recreation cancelled for all selected containers.")
+		return
+	for api, plan, display_name in plans:
+		plan.pull_first = pull_decision
+		action_log.append(f"Recreating container {display_name} in the background.")
+		executor.submit(_run_recreate_logged, api, plan, action_log)
+
+
 def _apply_picker_action(
 	api: DockerAPI,
 	containers: list[dict[str, Any]],
@@ -984,59 +1133,9 @@ def _apply_picker_action(
 				)
 		return
 	if action == "recreate":
-		plans = []
-		preparation_failed = False
-		for container in containers:
-			name = _container_name(container)
-			action_log.append(f"Preparing recreation of container {name}.")
-			try:
-				plan = _prepare_recreate(api, container["Id"])
-			except (DockerError, OSError) as error:
-				action_log.append(
-					f"ERROR preparing {name} for recreation: {error}", refresh=True
-				)
-				preparation_failed = True
-				continue
-			plans.append(plan)
-		if preparation_failed or len(plans) != len(containers):
-			action_log.append(
-				"Recreation cancelled; not all selected containers could be prepared.",
-				refresh=True,
-			)
-			return
-		container_names = [plan.name for plan in plans]
-		image_details = [f"{plan.name}: {plan.image}" for plan in plans]
-		pull_decision = _confirm_dialog(
-			"Pull all selected images before recreating?",
-			container_names,
-			image_details,
+		_recreate_context_batch(
+			[(api, container) for container in containers], executor, action_log
 		)
-		if pull_decision is None:
-			action_log.append("Recreation cancelled for all selected containers.")
-			return
-		pull_first = pull_decision
-		confirmation_details = [
-			"All listed containers will be replaced.",
-			"Configured mounts will be reused where available.",
-		]
-		auto_remove_names = [plan.name for plan in plans if plan.auto_remove]
-		if auto_remove_names:
-			confirmation_details.append(
-				"Auto-remove is enabled for: "
-				+ ", ".join(auto_remove_names)
-				+ "; anonymous volume data may be removed when stopped."
-			)
-		if _confirm_dialog(
-			"Recreate all selected containers?",
-			container_names,
-			confirmation_details,
-		) is not True:
-			action_log.append("Recreation cancelled for all selected containers.")
-			return
-		for plan in plans:
-			plan.pull_first = pull_first
-			action_log.append(f"Recreating container {plan.name} in the background.")
-			executor.submit(_run_recreate_logged, api, plan, action_log)
 		return
 	start_messages = {
 		"start": "Starting",
@@ -1126,41 +1225,48 @@ def _docker_contexts() -> list[dict[str, Any]]:
 	]
 
 
+def _comma_separated_values(argument: str, option: str) -> list[str]:
+	values = [value.strip() for value in argument.split(",")]
+	if not values or any(not value for value in values):
+		raise DockerError(f"{option} expects non-empty comma-separated values.")
+	return values
+
+
 def _pick_docker_context(
-	contexts: list[dict[str, Any]], current_context_name: str | None
-) -> dict[str, Any] | None:
+	contexts: list[dict[str, Any]], current_context_names: set[str]
+) -> list[dict[str, Any]] | None:
 	if not contexts:
 		return None
 	terminal_size = shutil.get_terminal_size((80, 24))
 	columns = max(1, terminal_size.columns - 1)
-	selected_index = next(
-		(
-			index
-			for index, context in enumerate(contexts)
-			if context.get("Name") == current_context_name
-		),
-		next(
-			(index for index, context in enumerate(contexts) if context.get("Current")),
-			0,
-		),
-	)
+	selected_contexts = {
+		index
+		for index, context in enumerate(contexts)
+		if context.get("Name") in current_context_names
+	}
+	if not selected_contexts:
+		selected_contexts = {
+			index for index, context in enumerate(contexts) if context.get("Current")
+		}
+	selected_index = min(selected_contexts, default=0)
 	file_descriptor = sys.stdin.fileno()
 	original_terminal = termios.tcgetattr(file_descriptor)
 	try:
 		tty.setraw(file_descriptor)
 		while True:
-			lines = ["Docker contexts", ""]
+			lines = ["Docker contexts (Space toggles; Enter applies)", ""]
 			for index, context in enumerate(contexts):
 				current = " (current)" if context.get("Current") else ""
 				endpoint = context.get("DockerEndpoint", "")
-				line = f"{'>' if index == selected_index else ' '} {context['Name']}{current}: {endpoint}"
+				checked = "[x]" if index in selected_contexts else "[ ]"
+				line = f"{'>' if index == selected_index else ' '} {checked} {context['Name']}{current}: {endpoint}"
 				if context.get("Error"):
 					line += f" ({context['Error']})"
 				line = line[:columns]
 				if index == selected_index:
 					line = f"\033[7m{line.ljust(columns)}\033[0m"
 				lines.append(line)
-			lines.extend(["", "Up/Down: select   Enter: switch   q: cancel"])
+			lines.extend(["", "Up/Down: move   Space: toggle   Enter: apply   q: cancel"])
 			sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines))
 			sys.stdout.flush()
 			key = _read_picker_key()
@@ -1168,8 +1274,15 @@ def _pick_docker_context(
 				selected_index = max(0, selected_index - 1)
 			elif key == "down":
 				selected_index = min(len(contexts) - 1, selected_index + 1)
+			elif key == "toggle":
+				if selected_index in selected_contexts:
+					selected_contexts.remove(selected_index)
+				else:
+					selected_contexts.add(selected_index)
 			elif key == "confirm":
-				return contexts[selected_index]
+				if selected_contexts:
+					return [contexts[index] for index in sorted(selected_contexts)]
+				return None
 			elif key in {"quit", "action_down", "back"}:
 				return None
 	finally:
@@ -1178,80 +1291,153 @@ def _pick_docker_context(
 		sys.stdout.flush()
 
 
-def _initial_docker_api(
-	context_argument: str | None,
-	socket_argument: str | None,
-) -> tuple[DockerAPI, str | None]:
-	if socket_argument:
-		return DockerAPI(socket_argument), None
-	if context_argument:
-		if not shutil.which("docker"):
-			raise DockerError("--context requires the Docker CLI.")
-		context = next(
-			(
-				item
-				for item in _docker_contexts()
-				if item.get("Name") == context_argument
-			),
-			None,
+def _targets_from_contexts(
+	contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+	return [
+		{
+			"name": context["Name"],
+			"endpoint": context["DockerEndpoint"],
+			"api": DockerAPI(context["DockerEndpoint"]),
+		}
+		for context in contexts
+	]
+
+
+def _apply_context_action(
+	targets: list[dict[str, Any]],
+	containers: list[dict[str, Any]],
+	action: str,
+	executor: ThreadPoolExecutor,
+	action_log: ActionLog,
+) -> None:
+	target_apis = {target["name"]: target["api"] for target in targets}
+	groups = _group_context_containers(containers)
+	for context_name in groups:
+		if context_name not in target_apis:
+			raise DockerError(f"No active Docker target for context {context_name}.")
+	api_containers = [
+		(target_apis[context_name], container)
+		for context_name, group in groups.items()
+		for container in group
+	]
+	qualify_names = len(groups) > 1
+	if action == "recreate":
+		_recreate_context_batch(api_containers, executor, action_log)
+		return
+	if action == "delete":
+		container_names = [
+			f"{_container_context(container)}/{_container_name(container)}"
+			if qualify_names
+			else _container_name(container)
+			for _, container in api_containers
+		]
+		if not _confirm_delete(container_names):
+			action_log.append("Deletion cancelled.")
+			return
+		for api, container in api_containers:
+			name = (
+				f"{_container_context(container)}/{_container_name(container)}"
+				if qualify_names
+				else _container_name(container)
+			)
+			action_log.append(f"Deleting container {name}.")
+			executor.submit(
+				_run_background_action, api, container, action, action_log
+			)
+		return
+	for context_name, group in groups.items():
+		_apply_picker_action(
+			target_apis[context_name], group, action, executor, action_log
 		)
-		if context is None:
-			raise DockerError(f"Docker context not found: {context_argument}")
-		return DockerAPI(context["DockerEndpoint"]), context["Name"]
+
+
+def _socket_targets(socket_argument: str) -> list[dict[str, Any]]:
+	endpoints = _comma_separated_values(socket_argument, "--socket")
+	return [
+		{
+			"name": f"socket{index + 1}",
+			"endpoint": endpoint,
+			"api": DockerAPI(endpoint),
+		}
+		for index, endpoint in enumerate(endpoints)
+	]
+
+
+def _initial_docker_targets(
+	contexts_argument: str | None,
+	socket_argument: str | None,
+) -> list[dict[str, Any]]:
+	if socket_argument:
+		return _socket_targets(socket_argument)
+	if contexts_argument:
+		if not shutil.which("docker"):
+			raise DockerError("--contexts requires the Docker CLI.")
+		all_contexts = {context["Name"]: context for context in _docker_contexts()}
+		requested_names = _comma_separated_values(contexts_argument, "--contexts")
+		missing_names = [name for name in requested_names if name not in all_contexts]
+		if missing_names:
+			raise DockerError(
+				"Docker context not found: " + ", ".join(missing_names)
+			)
+		return _targets_from_contexts(
+			[all_contexts[name] for name in dict.fromkeys(requested_names)]
+		)
 	if os.environ.get("DOCKER_HOST") and not os.environ.get("DOCKER_CONTEXT"):
-		return DockerAPI(_docker_host_endpoint()), None
+		return _socket_targets(_docker_host_endpoint())
 	if not shutil.which("docker"):
 		if os.environ.get("DOCKER_CONTEXT"):
 			raise DockerError("DOCKER_CONTEXT requires the Docker CLI.")
-		return DockerAPI(_docker_host_endpoint()), None
+		return _socket_targets(_docker_host_endpoint())
 	contexts = _docker_contexts()
 	context_name = os.environ.get("DOCKER_CONTEXT")
-	context = next(
-		(
-			item
-			for item in contexts
-			if item.get("Name") == context_name
-		),
-		next((item for item in contexts if item.get("Current")), None),
-	)
+	context = next((item for item in contexts if item.get("Name") == context_name), None)
 	if context is None:
-		return DockerAPI(_docker_host_endpoint()), None
-	return DockerAPI(context["DockerEndpoint"]), context["Name"]
+		context = next((item for item in contexts if item.get("Current")), None)
+	if context is None:
+		return _socket_targets(_docker_host_endpoint())
+	return _targets_from_contexts([context])
 
 
 def main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	connection_options = parser.add_mutually_exclusive_group()
 	connection_options.add_argument(
-		"--context", help="Docker context to use on startup"
+		"--contexts",
+		"--context",
+		dest="contexts",
+		help="comma-separated Docker contexts to display (--context is an alias)",
 	)
 	connection_options.add_argument(
 		"--socket",
-		help="Unix socket path or SSH endpoint (for example, ssh://user@host)",
+		help="comma-separated Unix socket paths or SSH endpoints",
 	)
 	arguments = parser.parse_args()
 
 	try:
-		api, current_context_name = _initial_docker_api(
-			arguments.context, arguments.socket
-		)
+		targets = _initial_docker_targets(arguments.contexts, arguments.socket)
 		with ThreadPoolExecutor(max_workers=8) as executor:
-			registry_checks = RegistryChecks(api, executor, {})
+			registry_checks = ContextRegistryChecks(targets, executor)
 			picker_state = PickerState()
 			action_log = ActionLog()
 			while True:
 				last_action_refresh = action_log.completion_generation()
-				containers = api.list_containers()
+				containers = registry_checks.api.list_containers()
 				registry_checks.update(containers)
+				context_title = ",".join(target["name"] for target in targets)
+				endpoint_title = ",".join(target["endpoint"] for target in targets)
+				daemon_title = ",".join(
+					dict.fromkeys(str(target["api"].daemon_version) for target in targets)
+				)
 				selection = _select_containers(
 					containers,
 					registry_checks,
 					picker_state,
 					action_log,
 					last_action_refresh,
-					current_context_name,
-					api.endpoint,
-					api.daemon_version,
+					context_title,
+					endpoint_title,
+					daemon_title,
 				)
 				if selection is None:
 					return 0
@@ -1259,26 +1445,34 @@ def main() -> int:
 				if shortcut_action == "contexts":
 					try:
 						contexts = _docker_contexts()
-						context = _pick_docker_context(contexts, current_context_name)
-						if context is None:
+						selected_contexts = _pick_docker_context(
+							contexts, {target["name"] for target in targets}
+						)
+						if selected_contexts is None:
 							continue
-						new_api = DockerAPI(context["DockerEndpoint"])
+						new_targets = _targets_from_contexts(selected_contexts)
 					except (DockerError, OSError, KeyError) as error:
 						action_log.append(f"ERROR switching Docker context: {error}", refresh=True)
 						continue
-					api = new_api
-					current_context_name = context["Name"]
-					registry_checks = RegistryChecks(api, executor, {})
+					targets = new_targets
+					registry_checks = ContextRegistryChecks(targets, executor)
 					picker_state.active_name = None
 					picker_state.active_index = 0
 					picker_state.selected_names.clear()
 					action_log.append(
-						f"Switched to Docker context {current_context_name}.", refresh=True
+						"Switched to Docker contexts "
+						+ ", ".join(target["name"] for target in targets)
+						+ ".",
+						refresh=True,
 					)
 					continue
 				if shortcut_action:
-					_apply_picker_action(
-						api, selected_containers, shortcut_action, executor, action_log
+					_apply_context_action(
+						targets,
+						selected_containers,
+						shortcut_action,
+						executor,
+						action_log,
 					)
 					if shortcut_action in {"pull", "recreate"}:
 						registry_checks.invalidate(selected_containers)
@@ -1286,8 +1480,12 @@ def main() -> int:
 				for container in selected_containers:
 					menu_action = _container_actions(container)
 					if menu_action != "back":
-						_apply_picker_action(
-							api, [container], menu_action, executor, action_log
+						_apply_context_action(
+							targets,
+							[container],
+							menu_action,
+							executor,
+							action_log,
 						)
 					if menu_action in {"pull", "recreate"}:
 						registry_checks.invalidate([container])

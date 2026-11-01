@@ -20,20 +20,19 @@ From the repository directory:
 python3 dockside.py
 ```
 
-To start with a specific Docker context:
+To display multiple Docker contexts together:
 
 ```sh
-python3 dockside.py --context arya
+python3 dockside.py --contexts arya,default
 ```
 
-To connect directly to a Unix socket or SSH endpoint:
+`--context` remains an alias for `--contexts`. To combine direct Unix socket or SSH endpoints:
 
 ```sh
-python3 dockside.py --socket /var/run/docker.sock
-python3 dockside.py --socket ssh://user@host
+python3 dockside.py --socket /var/run/docker.sock,ssh://user@host
 ```
 
-`--context` and `--socket` are mutually exclusive. Without either, Dockside uses `DOCKER_CONTEXT`, the Docker CLI's current context, or `DOCKER_HOST` if set. Your user must have permission to access the configured Docker endpoint.
+`--contexts` and `--socket` are mutually exclusive. Without either, Dockside uses the context selected by `DOCKER_CONTEXT` or the Docker CLI, or `DOCKER_HOST` if set. Your user must have permission to access every configured endpoint.
 
 Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH endpoints are supported; TCP endpoints are not currently supported.
 
@@ -43,7 +42,7 @@ Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH
 - Left/Right: change the sort column; `s` toggles ascending/descending
 - Space: toggle the active container's selection
 - Ctrl+A: select all containers (`A` also works)
-- `c`: choose a Docker context
+- `c`: choose multiple Docker contexts (`Space` toggles; Enter applies)
 - `C`: clear the selection
 - Enter: open the action menu for selected containers
 - `l`: view logs for the active or selected containers
