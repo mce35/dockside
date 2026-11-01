@@ -586,7 +586,7 @@ def _render_container_picker(
 		header_lines = ["Select containers", column_header]
 		footer_lines = [
 			registry_progress,
-			"Enter: actions  Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
+			"Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
 			"i: inspect  Left/Right: sort column  s: direction  Up/Down: move",
 			"c: contexts  Ctrl+A: all  C: clear  a/q: action log  Ctrl+Q: quit",
 		]
@@ -922,18 +922,6 @@ def _select_containers(
 				action_log.scroll(-1)
 			elif key == "clear":
 				selected_ids.clear()
-			elif key == "confirm":
-				target_ids = selected_ids or {
-					_container_key(containers[active_index])
-				}
-				return (
-					[
-						container
-						for container in containers
-						if _container_key(container) in target_ids
-					],
-					None,
-				)
 			elif key in {
 				"contexts",
 				"inspect",
@@ -1149,52 +1137,6 @@ def _apply_picker_action(
 		name = _container_display_name(container)
 		action_log.append(f"{start_messages[action]} container {name}.")
 		executor.submit(_run_background_action, api, container, action, action_log)
-
-
-def _read_action_key(prompt: str) -> str:
-	if not sys.stdin.isatty():
-		return input(f"{prompt}: ").strip().casefold()
-	file_descriptor = sys.stdin.fileno()
-	original_terminal = termios.tcgetattr(file_descriptor)
-	try:
-		tty.setraw(file_descriptor)
-		sys.stdout.write(f"{prompt}: ")
-		sys.stdout.flush()
-		key = _read_picker_key()
-		if key == "action_down":
-			return "back"
-		if key == "sort_direction":
-			return "start"
-		return key
-	finally:
-		termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_terminal)
-		sys.stdout.write("\r\n")
-		sys.stdout.flush()
-
-
-def _container_actions(container: dict[str, Any]) -> str:
-	name = _container_name(container)
-	print(f"\nSelected: {name} ({container.get('Status', 'unknown')})")
-	actions = "i inspect, s start, Ctrl+S stop, r start/restart, Ctrl+R recreate, p pull, l logs, Ctrl+D delete, b/q back, Ctrl+Q quit"
-	while True:
-		action = _read_action_key(actions)
-		if action in {"b", "back"}:
-			return "back"
-		if action == "quit":
-			raise KeyboardInterrupt
-		if action == "inspect":
-			return "inspect"
-		if action == "recreate":
-			return "recreate"
-		if action in {"pull", "p"}:
-			return "pull"
-		if action in {"logs", "l"}:
-			return "logs"
-		if action == "delete":
-			return "delete"
-		if action in {"start", "stop", "restart"}:
-			return action
-		print("Choose one of the listed actions.")
 
 
 def _docker_host_endpoint() -> str:
@@ -1471,18 +1413,6 @@ def main() -> int:
 					if shortcut_action in {"pull", "recreate"}:
 						registry_checks.invalidate(selected_containers)
 					continue
-				for container in selected_containers:
-					menu_action = _container_actions(container)
-					if menu_action != "back":
-						_apply_context_action(
-							targets,
-							[container],
-							menu_action,
-							executor,
-							action_log,
-						)
-					if menu_action in {"pull", "recreate"}:
-						registry_checks.invalidate([container])
 	except (DockerError, OSError, KeyError) as error:
 		print(f"Error: {error}", file=sys.stderr)
 		return 1

@@ -44,7 +44,6 @@ Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH
 - Ctrl+A: select all containers (`A` also works)
 - `c`: choose multiple Docker contexts (`Space` toggles; Enter applies)
 - `C`: clear the selection
-- Enter: open the action menu for selected containers
 - `l`: view logs for the active or selected containers
 - `i`: inspect the active or selected containers
 - Ctrl+S: stop
