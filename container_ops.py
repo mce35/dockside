@@ -104,9 +104,16 @@ def _container_name(container: dict[str, Any]) -> str:
 	return names[0].lstrip("/") if names else container["Id"][:12]
 
 
+def _container_display_name(container: dict[str, Any]) -> str:
+	name = _container_name(container)
+	context_name = container.get("_DocksideContext")
+	return f"{context_name}/{name}" if context_name else name
+
+
 def _prepare_recreate(
 	api: DockerAPI,
 	container_id: str,
+	context_name: str | None = None,
 ) -> RecreatePlan:
 	inspection = api.inspect_container(container_id)
 	name = inspection.get("Name", "").lstrip("/") or container_id[:12]
@@ -125,25 +132,31 @@ def _prepare_recreate(
 		was_running=was_running,
 		auto_remove=auto_remove,
 		pull_first=False,
+		context_name=context_name,
 	)
+
+
+def _plan_display_name(plan: RecreatePlan) -> str:
+	return f"{plan.context_name}/{plan.name}" if plan.context_name else plan.name
 
 
 def _execute_recreate(
 	api: DockerAPI, plan: RecreatePlan, action_log: ActionLog
 ) -> None:
+	display_name = _plan_display_name(plan)
 	if plan.pull_first:
-		action_log.append(f"Pulling {plan.image} before recreating {plan.name}.")
+		action_log.append(f"Pulling {plan.image} before recreating {display_name}.")
 		api.pull_image(plan.image)
 	if plan.was_running:
-		action_log.append(f"Stopping container {plan.name} before recreation.")
+		action_log.append(f"Stopping container {display_name} before recreation.")
 		api.stop_container(plan.container_id)
 	if not (plan.was_running and plan.auto_remove):
 		api.remove_container(plan.container_id)
 	try:
 		created = api.create_container(plan.name, plan.payload)
 	except DockerError as create_error:
-		action_log.append(f"ERROR recreating {plan.name}: {create_error}")
-		action_log.append(f"Attempting to restore the previous configuration for {plan.name}.")
+		action_log.append(f"ERROR recreating {display_name}: {create_error}")
+		action_log.append(f"Attempting to restore the previous configuration for {display_name}.")
 		try:
 			restore_payload = copy.deepcopy(plan.payload)
 			original_image_id = plan.inspection.get("Image")
@@ -153,18 +166,18 @@ def _execute_recreate(
 			if plan.was_running:
 				api.start_container(restored["Id"])
 			action_log.append(
-				f"Previous configuration restored for {plan.name}.", refresh=True
+				f"Previous configuration restored for {display_name}.", refresh=True
 			)
 			return
 		except (DockerError, OSError) as restore_error:
 			action_log.append(
-				f"ERROR restoring {plan.name}: {restore_error}", refresh=True
+				f"ERROR restoring {display_name}: {restore_error}", refresh=True
 			)
 			raise
 	if plan.was_running:
-		action_log.append(f"Starting recreated container {plan.name}.")
+		action_log.append(f"Starting recreated container {display_name}.")
 		api.start_container(created["Id"])
-	action_log.append(f"Container {plan.name} recreated successfully.", refresh=True)
+	action_log.append(f"Container {display_name} recreated successfully.", refresh=True)
 
 
 def _delete_container(api: DockerAPI, container_id: str) -> None:
@@ -183,7 +196,7 @@ def _run_recreate_logged(
 	try:
 		_execute_recreate(api, plan, action_log)
 	except (DockerError, OSError) as error:
-		action_log.append(f"ERROR recreating {plan.name}: {error}", refresh=True)
+		action_log.append(f"ERROR recreating {_plan_display_name(plan)}: {error}", refresh=True)
 
 
 def _run_background_action(
@@ -192,7 +205,7 @@ def _run_background_action(
 	action: str,
 	action_log: ActionLog,
 ) -> None:
-	name = _container_name(container)
+	name = _container_display_name(container)
 	container_id = container["Id"]
 	try:
 		if action == "start":

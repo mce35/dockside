@@ -25,6 +25,7 @@ class RecreatePlan:
 	was_running: bool
 	auto_remove: bool
 	pull_first: bool
+	context_name: str | None = None
 
 
 class ActionLog:

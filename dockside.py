@@ -21,6 +21,7 @@ from typing import Any
 from container_logs import _decode_container_logs, _show_container_logs, _show_multiple_container_logs
 from container_models import ActionLog, PickerState
 from container_ops import (
+	_container_display_name,
     _container_name,
 	_delete_container,
 	_prepare_recreate,
@@ -1034,17 +1035,15 @@ def _recreate_context_batch(
 	executor: ThreadPoolExecutor,
 	action_log: ActionLog,
 ) -> None:
-	qualify_names = len({_container_context(container) for _, container in api_containers}) > 1
 	plans: list[tuple[DockerAPI, Any, str]] = []
 	preparation_failed = False
 	for api, container in api_containers:
-		name = _container_name(container)
-		display_name = (
-			f"{_container_context(container)}/{name}" if qualify_names else name
-		)
+		display_name = _container_display_name(container)
 		action_log.append(f"Preparing recreation of container {display_name}.")
 		try:
-			plan = _prepare_recreate(api, container["Id"])
+			plan = _prepare_recreate(
+				api, container["Id"], _container_context(container)
+			)
 		except (DockerError, OSError) as error:
 			action_log.append(
 				f"ERROR preparing {display_name} for recreation: {error}", refresh=True
@@ -1106,7 +1105,9 @@ def _apply_picker_action(
 	action_log: ActionLog,
 ) -> None:
 	if action == "delete":
-		container_names = [_container_name(container) for container in containers]
+		container_names = [
+			_container_display_name(container) for container in containers
+		]
 		if not _confirm_delete(container_names):
 			action_log.append("Deletion cancelled.")
 			return
@@ -1127,8 +1128,8 @@ def _apply_picker_action(
 			try:
 				_show_container_inspection(api, container)
 			except (DockerError, OSError) as error:
-				action_log.append(
-					f"ERROR inspecting {_container_name(container)}: {error}",
+					action_log.append(
+					f"ERROR inspecting {_container_display_name(container)}: {error}",
 					refresh=True,
 				)
 		return
@@ -1145,7 +1146,7 @@ def _apply_picker_action(
 		"delete": "Deleting",
 	}
 	for container in containers:
-		name = _container_name(container)
+		name = _container_display_name(container)
 		action_log.append(f"{start_messages[action]} container {name}.")
 		executor.submit(_run_background_action, api, container, action, action_log)
 
@@ -1321,26 +1322,19 @@ def _apply_context_action(
 		for context_name, group in groups.items()
 		for container in group
 	]
-	qualify_names = len(groups) > 1
 	if action == "recreate":
 		_recreate_context_batch(api_containers, executor, action_log)
 		return
 	if action == "delete":
 		container_names = [
-			f"{_container_context(container)}/{_container_name(container)}"
-			if qualify_names
-			else _container_name(container)
+			_container_display_name(container)
 			for _, container in api_containers
 		]
 		if not _confirm_delete(container_names):
 			action_log.append("Deletion cancelled.")
 			return
 		for api, container in api_containers:
-			name = (
-				f"{_container_context(container)}/{_container_name(container)}"
-				if qualify_names
-				else _container_name(container)
-			)
+			name = _container_display_name(container)
 			action_log.append(f"Deleting container {name}.")
 			executor.submit(
 				_run_background_action, api, container, action, action_log
