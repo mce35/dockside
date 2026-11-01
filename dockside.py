@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import select
 import shutil
@@ -87,7 +88,7 @@ def _read_picker_key() -> str:
 		"\x01": "all",
 		"a": "action_up",
 		"A": "all",
-		"c": "clear",
+		"c": "contexts",
 		"C": "clear",
 		"i": "inspect",
 		"i": "inspect",
@@ -475,6 +476,9 @@ def _render_container_picker(
 	action_log: ActionLog,
 	sort_column: str = "name",
 	sort_ascending: bool = True,
+	context_name: str | None = None,
+	docker_endpoint: str | None = None,
+	daemon_version: str | None = None,
 ) -> None:
 	terminal_size = shutil.get_terminal_size((80, 24))
 	columns = max(1, terminal_size.columns - 1)
@@ -494,16 +498,16 @@ def _render_container_picker(
 			registry_progress,
 			"Enter: actions  Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
 			"i: inspect  Left/Right: sort column  s: direction  Up/Down: move",
-			"Ctrl+A: all  c: clear  a/q: action log  Ctrl+Q: quit",
+			"c: contexts  Ctrl+A: all  C: clear  a/q: action log  Ctrl+Q: quit",
 		]
 	elif terminal_rows >= 9:
 		header_lines = ["Select containers"]
 		footer_lines = [
-			f"i: inspect  Left/Right: sort  s: direction  Ctrl+A: all  Ctrl+Q: quit"
+			f"c: contexts  i: inspect  sort: Left/Right  Ctrl+A: all  Ctrl+Q: quit"
 		]
 	elif terminal_rows >= 5:
 		header_lines = ["Select containers"]
-		footer_lines = ["i: inspect  Left/Right: sort  s: direction  Ctrl+Q: quit"]
+		footer_lines = ["c: contexts  i: inspect  Left/Right: sort  Ctrl+Q: quit"]
 	elif terminal_rows >= 2:
 		header_lines = [column_header]
 		footer_lines = []
@@ -543,16 +547,42 @@ def _render_container_picker(
 			f"Select containers ({len(selected_ids)} selected, "
 			f"showing {start_index + 1}-{end_index} of {len(containers)})"
 		)
-		if terminal_rows < 14:
-			title += f"  {_sort_label(sort_column, sort_column, sort_ascending)}"
-		header_lines[0:1] = [title] if header_lines else []
 	else:
 		start_index = 0
 		end_index = 0
-		if header_lines:
-			header_lines[0] = "No containers currently found."
-			if terminal_rows < 14:
-				header_lines[0] += f"  {_sort_label(sort_column, sort_column, sort_ascending)}"
+		title = "No containers currently found."
+	if context_name or docker_endpoint or daemon_version:
+		title_parts = [f"{len(selected_ids)} selected"]
+		if terminal_rows < 14:
+			title_parts.append(
+				f"sort={_sort_label(sort_column, sort_column, sort_ascending)}"
+			)
+		if context_name:
+			title_parts.append(f"context={context_name}")
+		if daemon_version:
+			title_parts.append(f"daemon={daemon_version}")
+		if docker_endpoint:
+			socket_value = (
+				docker_endpoint[len("unix://") :]
+				if docker_endpoint.startswith("unix://")
+				else docker_endpoint
+			)
+			socket_prefix = f"{' | '.join(title_parts)} | socket="
+			available = max(0, columns - len(socket_prefix))
+			if len(socket_value) > available:
+				socket_value = (
+					socket_value[: available - 3] + "..."
+					if available >= 3
+					else socket_value[:available]
+				)
+			title = socket_prefix + socket_value
+		else:
+			title = " | ".join(title_parts)
+	else:
+		if terminal_rows < 14:
+			title += f"  {_sort_label(sort_column, sort_column, sort_ascending)}"
+	if header_lines:
+		header_lines[0] = title
 	lines = [line[:columns] for line in header_lines]
 	for index in range(start_index, end_index):
 		container = containers[index]
@@ -676,6 +706,9 @@ def _select_containers(
 	picker_state: PickerState,
 	action_log: ActionLog,
 	last_action_refresh: int,
+	context_name: str | None = None,
+	docker_endpoint: str | None = None,
+	daemon_version: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None] | None:
 	if not sys.stdin.isatty():
 		raise DockerError("Container selection requires an interactive terminal.")
@@ -754,6 +787,9 @@ def _select_containers(
 				action_log,
 				picker_state.sort_column,
 				picker_state.sort_ascending,
+				context_name,
+				docker_endpoint,
+				daemon_version,
 			)
 			wait_time = min(0.2, max(0, next_refresh - time.monotonic()))
 			readable, _, _ = select.select([file_descriptor], [], [], wait_time)
@@ -763,6 +799,8 @@ def _select_containers(
 			if not containers:
 				if key == "quit":
 					return None
+				if key == "contexts":
+					return [], "contexts"
 				continue
 			if key == "up":
 				active_index = max(0, active_index - 1)
@@ -801,6 +839,7 @@ def _select_containers(
 					None,
 				)
 			elif key in {
+				"contexts",
 				"inspect",
 				"logs",
 				"stop",
@@ -1041,25 +1080,144 @@ def _container_actions(container: dict[str, Any]) -> str:
 		print("Choose one of the listed actions.")
 
 
-def _socket_path(argument: str | None) -> str:
-	if argument:
-		return argument
-	docker_host = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
-	if not docker_host.startswith("unix://"):
-		raise DockerError("Only Unix-socket Docker hosts are supported; use --socket to specify one.")
-	return docker_host[len("unix://") :]
+def _docker_host_endpoint() -> str:
+	return os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+
+
+def _docker_contexts() -> list[dict[str, Any]]:
+	try:
+		result = subprocess.run(
+			["docker", "context", "ls", "--format", "{{json .}}"],
+			capture_output=True,
+			text=True,
+			timeout=10,
+			check=False,
+		)
+	except (OSError, subprocess.TimeoutExpired) as error:
+		raise DockerError(f"Could not list Docker contexts: {error}") from error
+	if result.returncode:
+		detail = result.stderr.strip() or "Docker context list failed."
+		raise DockerError(detail)
+	try:
+		contexts = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+	except json.JSONDecodeError as error:
+		raise DockerError("Docker returned an invalid context list.") from error
+	return [
+		context
+		for context in contexts
+		if context.get("Name") and context.get("DockerEndpoint")
+	]
+
+
+def _pick_docker_context(
+	contexts: list[dict[str, Any]], current_context_name: str | None
+) -> dict[str, Any] | None:
+	if not contexts:
+		return None
+	terminal_size = shutil.get_terminal_size((80, 24))
+	columns = max(1, terminal_size.columns - 1)
+	selected_index = next(
+		(
+			index
+			for index, context in enumerate(contexts)
+			if context.get("Name") == current_context_name
+		),
+		next(
+			(index for index, context in enumerate(contexts) if context.get("Current")),
+			0,
+		),
+	)
+	file_descriptor = sys.stdin.fileno()
+	original_terminal = termios.tcgetattr(file_descriptor)
+	try:
+		tty.setraw(file_descriptor)
+		while True:
+			lines = ["Docker contexts", ""]
+			for index, context in enumerate(contexts):
+				current = " (current)" if context.get("Current") else ""
+				endpoint = context.get("DockerEndpoint", "")
+				line = f"{'>' if index == selected_index else ' '} {context['Name']}{current}: {endpoint}"
+				if context.get("Error"):
+					line += f" ({context['Error']})"
+				line = line[:columns]
+				if index == selected_index:
+					line = f"\033[7m{line.ljust(columns)}\033[0m"
+				lines.append(line)
+			lines.extend(["", "Up/Down: select   Enter: switch   q: cancel"])
+			sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines))
+			sys.stdout.flush()
+			key = _read_picker_key()
+			if key == "up":
+				selected_index = max(0, selected_index - 1)
+			elif key == "down":
+				selected_index = min(len(contexts) - 1, selected_index + 1)
+			elif key == "confirm":
+				return contexts[selected_index]
+			elif key in {"quit", "action_down", "back"}:
+				return None
+	finally:
+		termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_terminal)
+		sys.stdout.write("\033[0m\n")
+		sys.stdout.flush()
+
+
+def _initial_docker_api(
+	context_argument: str | None,
+	socket_argument: str | None,
+) -> tuple[DockerAPI, str | None]:
+	if socket_argument:
+		return DockerAPI(socket_argument), None
+	if context_argument:
+		if not shutil.which("docker"):
+			raise DockerError("--context requires the Docker CLI.")
+		context = next(
+			(
+				item
+				for item in _docker_contexts()
+				if item.get("Name") == context_argument
+			),
+			None,
+		)
+		if context is None:
+			raise DockerError(f"Docker context not found: {context_argument}")
+		return DockerAPI(context["DockerEndpoint"]), context["Name"]
+	if os.environ.get("DOCKER_HOST") and not os.environ.get("DOCKER_CONTEXT"):
+		return DockerAPI(_docker_host_endpoint()), None
+	if not shutil.which("docker"):
+		if os.environ.get("DOCKER_CONTEXT"):
+			raise DockerError("DOCKER_CONTEXT requires the Docker CLI.")
+		return DockerAPI(_docker_host_endpoint()), None
+	contexts = _docker_contexts()
+	context_name = os.environ.get("DOCKER_CONTEXT")
+	context = next(
+		(
+			item
+			for item in contexts
+			if item.get("Name") == context_name
+		),
+		next((item for item in contexts if item.get("Current")), None),
+	)
+	if context is None:
+		return DockerAPI(_docker_host_endpoint()), None
+	return DockerAPI(context["DockerEndpoint"]), context["Name"]
 
 
 def main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
-	parser.add_argument(
+	connection_options = parser.add_mutually_exclusive_group()
+	connection_options.add_argument(
+		"--context", help="Docker context to use on startup"
+	)
+	connection_options.add_argument(
 		"--socket",
-		help="Docker Unix socket path (default: DOCKER_HOST or /var/run/docker.sock)",
+		help="Unix socket path or SSH endpoint (for example, ssh://user@host)",
 	)
 	arguments = parser.parse_args()
 
 	try:
-		api = DockerAPI(_socket_path(arguments.socket))
+		api, current_context_name = _initial_docker_api(
+			arguments.context, arguments.socket
+		)
 		with ThreadPoolExecutor(max_workers=8) as executor:
 			registry_checks = RegistryChecks(api, executor, {})
 			picker_state = PickerState()
@@ -1067,9 +1225,6 @@ def main() -> int:
 			while True:
 				last_action_refresh = action_log.completion_generation()
 				containers = api.list_containers()
-				if not containers:
-					_show_containers(containers)
-					return 0
 				registry_checks.update(containers)
 				selection = _select_containers(
 					containers,
@@ -1077,10 +1232,33 @@ def main() -> int:
 					picker_state,
 					action_log,
 					last_action_refresh,
+					current_context_name,
+					api.endpoint,
+					api.daemon_version,
 				)
 				if selection is None:
 					return 0
 				selected_containers, shortcut_action = selection
+				if shortcut_action == "contexts":
+					try:
+						contexts = _docker_contexts()
+						context = _pick_docker_context(contexts, current_context_name)
+						if context is None:
+							continue
+						new_api = DockerAPI(context["DockerEndpoint"])
+					except (DockerError, OSError, KeyError) as error:
+						action_log.append(f"ERROR switching Docker context: {error}", refresh=True)
+						continue
+					api = new_api
+					current_context_name = context["Name"]
+					registry_checks = RegistryChecks(api, executor, {})
+					picker_state.active_name = None
+					picker_state.active_index = 0
+					picker_state.selected_names.clear()
+					action_log.append(
+						f"Switched to Docker context {current_context_name}.", refresh=True
+					)
+					continue
 				if shortcut_action:
 					_apply_picker_action(
 						api, selected_containers, shortcut_action, executor, action_log

@@ -6,6 +6,7 @@ Dockside is an interactive Linux terminal tool for managing Docker containers. I
 
 - Linux with Python 3.10 or later
 - Docker Engine and access to its Unix socket (usually `/var/run/docker.sock`)
+- Docker CLI for context switching; OpenSSH client for SSH contexts
 - `less` for viewing container logs
 - A terminal that supports ANSI colors and keyboard input
 
@@ -19,13 +20,22 @@ From the repository directory:
 python3 dockside.py
 ```
 
-To use a non-default Docker socket:
+To start with a specific Docker context:
 
 ```sh
-python3 dockside.py --socket /path/to/docker.sock
+python3 dockside.py --context arya
 ```
 
-The `DOCKER_HOST=unix:///path/to/docker.sock` environment variable is also supported. Your user must have permission to access the Docker socket.
+To connect directly to a Unix socket or SSH endpoint:
+
+```sh
+python3 dockside.py --socket /var/run/docker.sock
+python3 dockside.py --socket ssh://user@host
+```
+
+`--context` and `--socket` are mutually exclusive. Without either, Dockside uses `DOCKER_CONTEXT`, the Docker CLI's current context, or `DOCKER_HOST` if set. Your user must have permission to access the configured Docker endpoint.
+
+Press `c` in the picker to switch among Docker CLI contexts. Unix-socket and SSH endpoints are supported; TCP endpoints are not currently supported.
 
 ## Picker Controls
 
@@ -33,7 +43,8 @@ The `DOCKER_HOST=unix:///path/to/docker.sock` environment variable is also suppo
 - Left/Right: change the sort column; `s` toggles ascending/descending
 - Space: toggle the active container's selection
 - Ctrl+A: select all containers (`A` also works)
-- `c`: clear the selection
+- `c`: choose a Docker context
+- `C`: clear the selection
 - Enter: open the action menu for selected containers
 - `l`: view logs for the active or selected containers
 - `i`: inspect the active or selected containers
