@@ -39,11 +39,12 @@ from terminal_colors import (
     ANSI_YELLOW,
 )
 
-_SORT_COLUMNS = ("id", "status", "name", "ports", "freshness", "image")
+_SORT_COLUMNS = ("id", "status", "name", "created", "ports", "freshness", "image")
 _SORT_LABELS = {
 	"id": "CONTAINER ID",
 	"status": "STATUS",
 	"name": "NAME",
+	"created": "CREATED",
 	"ports": "PORTS",
 	"freshness": "LATEST?",
 	"image": "IMAGE",
@@ -156,6 +157,18 @@ def _image_label(container: dict[str, Any], freshness: str) -> str:
 		return image
 	current_image = container.get("ImageID") or image
 	return f"Original: {image} (Current: {current_image})"
+
+
+def _container_created_label(container: dict[str, Any]) -> str:
+	created = container.get("Created")
+	try:
+		if isinstance(created, (int, float)):
+			return datetime.fromtimestamp(created).astimezone().strftime("%Y-%m-%d")
+		if isinstance(created, str):
+			return _format_created_date(created)[:10]
+	except (OSError, OverflowError, ValueError):
+		pass
+	return "Unavailable"
 
 
 def _container_port_labels(container: dict[str, Any]) -> list[str]:
@@ -455,6 +468,8 @@ def _sort_containers(
 			return container.get("Id", "").casefold()
 		if sort_column == "status":
 			return container.get("Status", "").casefold()
+		if sort_column == "created":
+			return _container_created_label(container).casefold()
 		if sort_column == "ports":
 			return _container_ports(container).casefold()
 		if sort_column == "freshness":
@@ -488,6 +503,7 @@ def _render_container_picker(
 		f"{_sort_label('id', sort_column, sort_ascending):12}  "
 		f"{_sort_label('status', sort_column, sort_ascending):8}  "
 		f"{_sort_label('name', sort_column, sort_ascending):16}  "
+		f"{_sort_label('created', sort_column, sort_ascending):12}  "
 		f"{_sort_label('ports', sort_column, sort_ascending):{_PORTS_COLUMN_WIDTH}}  "
 		f"{_sort_label('freshness', sort_column, sort_ascending):8}  "
 		f"{_sort_label('image', sort_column, sort_ascending)}"
@@ -590,14 +606,15 @@ def _render_container_picker(
 		prefix = f"{index + 1:>3}  {marker:3}  {container['Id'][:12]:12}  "
 		status = container.get("Status", "")[:8]
 		name = _container_name(container)[:16]
+		created = _container_created_label(container)
 		ports = _container_ports_cell(container, _PORTS_COLUMN_WIDTH)
 		freshness = image_freshness.get(container["Id"], "UNKNOWN")
 		image = _image_label(container, freshness)
 		freshness_start = (
-			len(prefix) + 8 + 2 + 16 + 2 + _PORTS_COLUMN_WIDTH + 2
+			len(prefix) + 8 + 2 + 16 + 2 + 12 + 2 + _PORTS_COLUMN_WIDTH + 2
 		)
 		line = (
-			f"{prefix}{status:8}  {name:16}  "
+			f"{prefix}{status:8}  {name:16}  {created:12}  "
 			f"{ports:{_PORTS_COLUMN_WIDTH}}  "
 			f"{freshness:8}  "
 			f"{image}"
