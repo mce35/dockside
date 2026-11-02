@@ -10,7 +10,7 @@ Dockside is an interactive Linux terminal tool for managing Docker containers. I
 - `less` for viewing container logs
 - A terminal that supports ANSI colors and keyboard input
 
-No third-party Python packages are required.
+No third-party Python packages are required to run Dockside. Pytest is required to run the test suite.
 
 ## Run
 
@@ -82,3 +82,11 @@ Logs open in `less` at the newest entries. Multi-container log views merge times
 - `image_registry.py`: remote registry manifest checks and freshness status
 - `container_logs.py`: log retrieval, merging, and pager integration
 - `terminal_colors.py`: ANSI color constants
+
+## Tests
+
+Run the tests with:
+
+```sh
+python3 -m pytest
+```

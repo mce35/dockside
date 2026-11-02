@@ -481,7 +481,6 @@ def _format_bytes(value: Any) -> str:
 		amount /= 1024
 		if amount < 1024 or unit == "TiB":
 			return f"{amount:.1f} {unit} ({byte_count:,} B)"
-	return f"{byte_count:,} B"
 
 
 def _format_created_date(created: str | None) -> str:
@@ -1273,8 +1272,6 @@ def _select_volumes(
 				else: state.selected_keys.add(key)
 			elif key == "all": state.selected_keys = {_volume_key(v) for v in volumes}
 			elif key == "clear": state.selected_keys.clear()
-			elif key == "action_up": action_log.scroll(1)
-			elif key == "action_down": action_log.scroll(-1)
 			elif key == "delete" and volumes:
 				selected = state.selected_keys or {_volume_key(volumes[active])}
 				chosen = [v for v in volumes if _volume_key(v) in selected and _volume_key(v) not in pending]
