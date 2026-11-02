@@ -212,6 +212,12 @@ class DockerAPI:
 			query={"force": 0, "noprune": 0},
 		)
 
+	def list_volumes(self) -> list[dict[str, Any]]:
+		return self.request("GET", "/volumes").get("Volumes") or []
+
+	def remove_volume(self, name: str) -> None:
+		self.request("DELETE", f"/volumes/{quote(name, safe='')}")
+
 	def container_logs(self, container_id: str) -> bytes:
 		return self.request(
 			"GET",

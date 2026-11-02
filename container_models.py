@@ -24,6 +24,14 @@ class ImagePickerState:
 
 
 @dataclass
+class VolumePickerState:
+	active_key: str | None = None
+	selected_keys: set[str] = field(default_factory=set)
+	sort_column: str = "name"
+	sort_ascending: bool = True
+
+
+@dataclass
 class RecreatePlan:
 	container_id: str
 	name: str

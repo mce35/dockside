@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any
 
 from container_logs import _decode_container_logs, _show_container_logs, _show_multiple_container_logs
-from container_models import ActionLog, ImagePickerState, PickerState
+from container_models import ActionLog, ImagePickerState, PickerState, VolumePickerState
 from container_ops import (
 	_container_display_name,
     _container_name,
@@ -41,14 +41,14 @@ from terminal_colors import (
 )
 
 _SORT_COLUMNS = (
+	"context",
 	"id",
 	"status",
 	"name",
-	"context",
+	"image",
 	"created",
 	"ports",
 	"freshness",
-	"image",
 )
 _SORT_LABELS = {
 	"id": "CONTAINER ID",
@@ -98,6 +98,7 @@ def _read_picker_key() -> str:
 			return {
 				"P": "container_view",
 				"Q": "images",
+				"R": "volumes",
 				"H": "home",
 				"F": "end",
 			}.get(sys.stdin.read(1), "")
@@ -124,6 +125,7 @@ def _read_picker_key() -> str:
 					"8": "end",
 					"11": "container_view",
 					"12": "images",
+					"13": "volumes",
 				}.get(sequence, "")
 		return ""
 	return {
@@ -170,6 +172,8 @@ def _action_line_color(line: str) -> str | None:
 			"Stopped container ",
 			"Restarted container ",
 			"Deleted container ",
+			"Deleted volume ",
+			"Deleted image ",
 			"Image pull completed for container ",
 			"Previous configuration restored for ",
 			"Container log view closed.",
@@ -195,7 +199,7 @@ def _common_view_header(
 	metadata = (
 		f"daemon={daemon_version} | context={context_names} | socket={sockets}"
 	)
-	suffix_width = len(" | F1 containers | F2 images")
+	suffix_width = len(" | F1 containers | F2 images | F3 volumes")
 	metadata_width = max(0, width - suffix_width)
 	if len(metadata) > metadata_width:
 		metadata = (
@@ -205,11 +209,14 @@ def _common_view_header(
 		)
 	containers_tab = "F1 containers"
 	images_tab = "F2 images"
+	volumes_tab = "F3 volumes"
 	if active_view == "containers":
 		containers_tab = f"\033[7m{containers_tab}\033[0m"
-	else:
+	elif active_view == "images":
 		images_tab = f"\033[7m{images_tab}\033[0m"
-	return f"{metadata} | {containers_tab} | {images_tab}"
+	else:
+		volumes_tab = f"\033[7m{volumes_tab}\033[0m"
+	return f"{metadata} | {containers_tab} | {images_tab} | {volumes_tab}"
 
 
 def _status_color(container: dict[str, Any]) -> str:
@@ -345,6 +352,10 @@ def _image_key(image: dict[str, Any]) -> str:
 	return image.get("_DocksideKey", image.get("Id", ""))
 
 
+def _volume_key(volume: dict[str, Any]) -> str:
+	return volume.get("_DocksideKey", volume.get("Name", ""))
+
+
 def _image_context(image: dict[str, Any]) -> str:
 	return image.get("_DocksideContext", "default")
 
@@ -417,6 +428,27 @@ def _list_context_images(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
 				continue
 			images.append(image)
 	return images
+
+
+def _list_context_volumes(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	volumes = []
+	for target in targets:
+		context_name = target["name"]
+		api = target["api"]
+		used_by: dict[str, set[str]] = {}
+		for listed_container in api.list_containers():
+			container = {**listed_container, "_DocksideContext": context_name}
+			container_name = _container_display_name(container)
+			for mount in listed_container.get("Mounts") or []:
+				if mount.get("Type") == "volume" and mount.get("Name"):
+					used_by.setdefault(mount["Name"], set()).add(container_name)
+		for listed_volume in api.list_volumes():
+			volume = dict(listed_volume)
+			volume["_DocksideContext"] = context_name
+			volume["_DocksideKey"] = f"{context_name}\0{volume.get('Name', '')}"
+			volume["_DocksideUsedBy"] = sorted(used_by.get(volume.get("Name", ""), set()))
+			volumes.append(volume)
+	return volumes
 
 
 def _run_image_delete(
@@ -734,33 +766,44 @@ def _render_container_picker(
 	selection_label = f"{len(selected_ids)}✓"
 	selection_width = max(4, len(selection_label))
 	number_width = max(2, len(str(len(containers))))
+	prefix_width = number_width + selection_width + 6
+	context_width = min(12, max(6, columns // 12))
+	id_width = min(12, max(8, columns // 10))
+	status_width = 11
+	created_width = min(12, max(10, columns // 10))
+	ports_width = min(_PORTS_COLUMN_WIDTH, max(8, columns // 5))
+	fixed_width = context_width + id_width + status_width + created_width + ports_width + 8 + 14
+	flex_width = columns - prefix_width - fixed_width
+	if flex_width < 2:
+		ports_width = max(1, ports_width + flex_width - 2)
+		fixed_width = context_width + id_width + status_width + created_width + ports_width + 8 + 14
+		flex_width = max(2, columns - prefix_width - fixed_width)
+	name_width = max(1, int(flex_width * 0.55))
+	image_width = max(1, flex_width - name_width)
+	def container_header(column: str, width: int) -> str:
+		return _sort_label(column, sort_column, sort_ascending)[:width].ljust(width)
 	column_header = (
 		f"{'':{number_width + 2}}  {selection_label:<{selection_width}}  "
-		f"{_sort_label('id', sort_column, sort_ascending):12}  "
-		f"{_sort_label('status', sort_column, sort_ascending):8}  "
-		f"{_sort_label('name', sort_column, sort_ascending):16}  "
-		f"{_sort_label('context', sort_column, sort_ascending):12}  "
-		f"{_sort_label('created', sort_column, sort_ascending):12}  "
-		f"{_sort_label('ports', sort_column, sort_ascending):{_PORTS_COLUMN_WIDTH}}  "
-		f"{_sort_label('freshness', sort_column, sort_ascending):8}  "
-		f"{_sort_label('image', sort_column, sort_ascending)}"
+		f"{container_header('context', context_width)}  "
+		f"{container_header('id', id_width)}  "
+		f"{container_header('status', status_width)}  "
+		f"{container_header('name', name_width)}  "
+		f"{container_header('image', image_width)}  "
+		f"{container_header('created', created_width)}  "
+		f"{container_header('ports', ports_width)}  "
+		f"{container_header('freshness', 8)}"
 	)
 	if terminal_rows >= 14:
 		header_lines = ["", column_header]
 		footer_lines = [
 			registry_progress,
 			"Ctrl+S: stop  r: start/restart  Ctrl+R: recreate  p: pull  Ctrl+D: delete",
-			"F2: images  i: inspect  Up/Down move  Home/End first/last  Left/Right sort  s direction",
+			"i: inspect  Up/Down move  Home/End first/last  Left/Right sort  s direction",
 			"c: contexts  Ctrl+A: all  C: clear  a/q: action log  Ctrl+Q: quit",
-		]
-	elif terminal_rows >= 9:
-		header_lines = ["", column_header]
-		footer_lines = [
-			f"F2: images  i: inspect  Home/End: first/last  sort: Left/Right"
 		]
 	elif terminal_rows >= 5:
 		header_lines = ["", column_header]
-		footer_lines = ["F2: images  Home/End: first/last  Left/Right: sort"]
+		footer_lines = ["i: inspect  Up/Down move  Home/End first/last  Left/Right sort  s direction"]
 	elif terminal_rows >= 2:
 		header_lines = [column_header]
 		footer_lines = []
@@ -830,31 +873,32 @@ def _render_container_picker(
 		prefix = (
 			f"{active_marker} {index + 1:<{number_width}}  "
 			f"{marker:<{selection_width}}  "
-			f"{container['Id'][:12]:12}  "
 		)
-		status = container.get("Status", "")[:8]
-		name = _container_name(container)[:16]
-		context = _container_context(container)[:12]
+		status = container.get("Status", "")
+		name = _container_name(container)
+		context = _container_context(container)
 		created = _container_created_label(container)
-		ports = _container_ports_cell(container, _PORTS_COLUMN_WIDTH)
+		ports = _container_ports_cell(container, ports_width)
 		freshness = image_freshness.get(container_key, "UNKNOWN")
 		image = _image_label(container, freshness)
-		freshness_start = (
-			len(prefix) + 8 + 2 + 16 + 2 + 12 + 2 + 12 + 2 + _PORTS_COLUMN_WIDTH + 2
-		)
 		line = (
-			f"{prefix}{status:8}  {name:16}  {context:12}  {created:12}  "
-			f"{ports:{_PORTS_COLUMN_WIDTH}}  "
-			f"{freshness:8}  "
-			f"{image}"
+			f"{prefix}{_truncate_cell(context, context_width)}  "
+			f"{container['Id'][:id_width]:<{id_width}}  "
+			f"{_truncate_cell(status, status_width)}  "
+			f"{_truncate_cell(name, name_width)}  "
+			f"{_truncate_cell(image, image_width)}  "
+			f"{_truncate_cell(created, created_width)}  "
+			f"{ports:<{ports_width}}  {freshness:8}"
 		)[:columns]
+		freshness_start = len(line) - 8
 		freshness_color = {
 			"CURRENT": ANSI_GREEN,
 			"OUTDATED": ANSI_RED,
 			"UNKNOWN": ANSI_BLUE,
 		}.get(freshness, ANSI_BLUE)
 		line = _paint_span(line, freshness_start, 8, freshness_color)
-		line = _paint_span(line, len(prefix), 8, _status_color(container))
+		status_start = len(prefix) + context_width + 2 + id_width + 2
+		line = _paint_span(line, status_start, status_width, _status_color(container))
 		if container_key in selected_ids:
 			line = f"{ANSI_LIGHT_GREEN_BG}{line.ljust(columns)}{ANSI_RESET_BG}"
 			if index == active_index:
@@ -863,7 +907,7 @@ def _render_container_picker(
 			line = f"\033[7m{line}\033[0m"
 		lines.append(line)
 	if show_separators:
-		lines.append("-" * columns)
+		lines.append("⎯" * columns)
 	if has_action_pane:
 		action_lines, action_start, action_total = action_log.visible(action_line_count)
 		if action_total:
@@ -878,7 +922,7 @@ def _render_container_picker(
 			lines.append("No actions yet."[:columns])
 		lines.extend(_color_action_line(line, columns) for line in action_lines)
 	if show_separators:
-		lines.append("-" * columns)
+		lines.append("⎯" * columns)
 	lines.extend(line[:columns] for line in footer_lines)
 	sys.stdout.write("\033[2J\033[H")
 	sys.stdout.write("\r\n".join(lines))
@@ -925,6 +969,26 @@ def _truncate_cell(value: str, width: int, *, align_right: bool = False) -> str:
 	return truncated.rjust(width) if align_right else truncated
 
 
+def _clip_ansi_line(line: str, width: int) -> str:
+	"""Clip to a visible terminal width without cutting ANSI sequences."""
+	result: list[str] = []
+	visible = 0
+	index = 0
+	while index < len(line) and visible < width:
+		if line[index] == "\033" and index + 1 < len(line) and line[index + 1] == "[":
+			end = line.find("m", index + 2)
+			if end >= 0:
+				result.append(line[index : end + 1])
+				index = end + 1
+				continue
+		result.append(line[index])
+		visible += 1
+		index += 1
+	if "\033[" in line:
+		result.append("\033[0m")
+	return "".join(result)
+
+
 def _format_image_size(value: Any) -> str:
 	return _format_bytes(value).split(" (", 1)[0]
 
@@ -942,29 +1006,25 @@ def _render_image_picker(
 	terminal_size = shutil.get_terminal_size((80, 24))
 	columns = max(1, terminal_size.columns - 1)
 	rows = max(1, terminal_size.lines)
-	context_width = min(12, max(6, columns // 12))
-	name_width = min(24, max(12, columns // 6))
-	sha_width = min(20, max(12, columns // 8))
-	size_width = 10
-	created_width = 10
 	number_width = max(2, len(str(len(images))))
-	used_width = min(
-		48,
-		max(
-			6,
-			columns
-			- 5
-			- 10
-			- context_width
-			- name_width
-			- sha_width
-			- size_width
-			- created_width,
-		),
-	)
 	selection_label = f"{len(selected_keys)}✓"
 	selection_width = max(4, len(selection_label))
-	number_width = max(2, len(str(len(images))))
+	context_width = min(12, max(6, columns // 12))
+	size_width = 10
+	created_width = 10
+	flex_width = max(
+		22,
+		columns
+		- number_width
+		- selection_width
+		- context_width
+		- size_width
+		- created_width
+		- 16,
+	)
+	name_width = max(8, int(flex_width * 0.38))
+	sha_width = max(8, int(flex_width * 0.28))
+	used_width = max(6, flex_width - name_width - sha_width)
 	column_header = (
 		f"{'':{number_width + 2}}  {selection_label:<{selection_width}}  "
 		f"{_image_column_label('context', state, context_width)}  "
@@ -978,10 +1038,10 @@ def _render_image_picker(
 	footer_lines = (
 		[
 			"Up/Down move  Space select  Ctrl+A all  C clear  Left/Right sort  s direction",
-			"a/q action log  Ctrl+D delete  F1 containers  F2 images  Ctrl+Q quit",
+			"a/q action log  Ctrl+D delete  Ctrl+Q quit",
 		]
 		if rows >= 9
-		else ["a/q action log  Ctrl+D delete  F1 containers  F2 images  Ctrl+Q quit"]
+		else ["a/q action log  Ctrl+D delete  Ctrl+Q quit"]
 		if rows >= 5
 		else []
 	)
@@ -1024,13 +1084,20 @@ def _render_image_picker(
 	common_header = _common_view_header(
 		daemon_version, context_names, sockets, "images", columns
 	)
-	lines = [common_header, title[:columns], column_header[:columns]]
+	lines = [
+		_clip_ansi_line(common_header, columns),
+		title[:columns],
+		column_header[:columns],
+	]
 	for index in range(start, end):
 		image = images[index]
 		key = _image_key(image)
 		marker = "[✓]" if key in selected_keys else "[ ]"
 		active_marker = ">" if index == active_index else " "
 		used = ", ".join(image.get("_DocksideUsed") or []) or "(none)"
+		used_cell = _truncate_cell(used, used_width)
+		if used == "(none)":
+			used_cell = f"{ANSI_RED}{used_cell}{ANSI_RESET_FG}"
 		fields = [
 			_truncate_cell(_image_context(image), context_width),
 			_truncate_cell(_image_name(image), name_width),
@@ -1039,7 +1106,7 @@ def _render_image_picker(
 				_format_image_size(image.get("Size")), size_width, align_right=True
 			),
 			_truncate_cell(_image_created_label(image), created_width),
-			_truncate_cell(used, used_width),
+			used_cell,
 		]
 		line = (
 			f"{active_marker} {index + 1:<{number_width}}  "
@@ -1051,10 +1118,10 @@ def _render_image_picker(
 			if index == active_index:
 				line = f"\033[4m{line}\033[24m"
 		elif index == active_index:
-			line = f"\033[7m{line[:columns]}\033[0m"
-		lines.append(line[:columns])
+			line = f"\033[7m{line}\033[0m"
+		lines.append(_clip_ansi_line(line, columns))
 	if has_action_pane:
-		lines.append("-" * columns)
+		lines.append("⎯" * columns)
 		if action_total:
 			if action_lines:
 				action_label = (
@@ -1073,6 +1140,159 @@ def _render_image_picker(
 	lines.extend(line[:columns] for line in footer_lines)
 	sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines))
 	sys.stdout.flush()
+
+
+def _run_volume_delete(api: DockerAPI, volume: dict[str, Any], action_log: ActionLog) -> None:
+	name = volume.get("Name", "")
+	context_name = volume.get("_DocksideContext", "default")
+	try:
+		api.remove_volume(name)
+		action_log.append(f"Deleted volume {context_name}/{name}.", refresh=True)
+	except (DockerError, OSError) as error:
+		action_log.append(f"ERROR deleting volume {context_name}/{name}: {error}", refresh=True)
+
+
+def _select_volumes(
+	targets: list[dict[str, Any]],
+	state: VolumePickerState,
+	action_log: ActionLog,
+	executor: ThreadPoolExecutor,
+) -> str:
+	volumes = _list_context_volumes(targets)
+	state.selected_keys.intersection_update(_volume_key(volume) for volume in volumes)
+	if state.active_key not in {_volume_key(volume) for volume in volumes}:
+		state.active_key = _volume_key(volumes[0]) if volumes else None
+	pending: dict[str, Future[None]] = {}
+	fd = sys.stdin.fileno()
+	original_terminal = termios.tcgetattr(fd)
+	try:
+		tty.setraw(fd)
+		while True:
+			completed = [key for key, future in pending.items() if future.done()]
+			if completed:
+				for key in completed:
+					pending.pop(key, None)
+				volumes = _list_context_volumes(targets)
+				state.selected_keys.intersection_update(_volume_key(v) for v in volumes)
+				if state.active_key not in {_volume_key(v) for v in volumes}:
+					state.active_key = _volume_key(volumes[0]) if volumes else None
+			volumes.sort(key=lambda v: (v.get("Name", "").casefold(), _volume_key(v)))
+			if state.sort_column == "context":
+				volumes.sort(key=lambda v: v.get("_DocksideContext", "").casefold(), reverse=not state.sort_ascending)
+			elif state.sort_column == "created":
+				volumes.sort(key=lambda v: v.get("CreatedAt", "") or "", reverse=not state.sort_ascending)
+			elif state.sort_column == "used":
+				volumes.sort(key=lambda v: ", ".join(v.get("_DocksideUsedBy") or []).casefold(), reverse=not state.sort_ascending)
+			else:
+				volumes.sort(key=lambda v: (v.get(state.sort_column.title(), "") or "").casefold(), reverse=not state.sort_ascending)
+			active = next((i for i, v in enumerate(volumes) if _volume_key(v) == state.active_key), 0)
+			size = shutil.get_terminal_size((80, 24))
+			width, rows = max(1, size.columns - 1), max(1, size.lines)
+			number_width = max(2, len(str(len(volumes))))
+			context_width = min(12, max(6, width // 12))
+			driver_width = 10
+			created_width = 10
+			selection_label = f"{len(state.selected_keys)}✓"
+			selection_width = max(4, len(selection_label))
+			flex_width = max(16, width - number_width - selection_width - context_width - driver_width - created_width - 16)
+			name_width = max(8, int(flex_width * 0.55))
+			used_width = max(8, flex_width - name_width)
+			def volume_sort_label(column: str, label: str, cell_width: int) -> str:
+				if state.sort_column == column:
+					label += " " + ("↑" if state.sort_ascending else "↓")
+				return label[:cell_width].ljust(cell_width)
+			head = (f"{'':{number_width + 2}}  {selection_label:<{selection_width}}  "
+				f"{volume_sort_label('context', 'CONTEXT', context_width)}  "
+				f"{volume_sort_label('name', 'NAME', name_width)}  "
+				f"{volume_sort_label('used', 'USED BY', used_width)}  "
+				f"{volume_sort_label('driver', 'DRIVER', driver_width)}  "
+				f"{volume_sort_label('created', 'CREATED', created_width)}")
+			has_action_pane = rows >= 7
+			footer = (
+				["Up/Down move  Space select  Ctrl+A all  C clear  Left/Right sort  s direction",
+				 "a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+				if rows >= 9
+				else ["a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+				if rows >= 5
+				else []
+			)
+			separator_count = int(has_action_pane)
+			max_action_lines = max(0, min(6, rows - 3 - len(footer) - separator_count - 2)) if has_action_pane else 0
+			action_lines, action_start, action_total = action_log.visible(max_action_lines)
+			action_display_count = max(1, len(action_lines)) if has_action_pane else 0
+			visible = max(0, rows - 3 - len(footer) - separator_count - (1 + action_display_count if has_action_pane else 0))
+			start = min(max(0, active - visible // 2), max(0, len(volumes) - visible))
+			lines = [_common_view_header(",".join(t['api'].daemon_version for t in targets), ",".join(t['name'] for t in targets), ",".join(t['endpoint'] for t in targets), "volumes", width), f"Docker volumes (showing {start + 1 if volumes else 0}-{min(len(volumes), start + visible)} of {len(volumes)})", head[:width]]
+			for i in range(start, min(len(volumes), start + visible)):
+				v = volumes[i]
+				used_by = ", ".join(v.get("_DocksideUsedBy") or []) or "(none)"
+				used_by_cell = _truncate_cell(used_by, used_width)
+				if used_by == "(none)":
+					used_by_cell = f"{ANSI_RED}{used_by_cell}{ANSI_RESET_FG}"
+				selected = _volume_key(v) in state.selected_keys
+				created = _format_created_date(v.get("CreatedAt"))[:10]
+				line = f"{'>' if i == active else ' '} {i + 1:<{number_width}}  {'[✓]' if selected else '[ ]':<{selection_width}}  {v.get('_DocksideContext', '')[:context_width]:{context_width}}  {_truncate_cell(v.get('Name', ''), name_width)}  {used_by_cell}  {_truncate_cell(v.get('Driver', ''), driver_width)}  {_truncate_cell(created, created_width)}"
+				if selected:
+					line = f"{ANSI_LIGHT_GREEN_BG}{line}{ANSI_RESET_BG}"
+					if i == active:
+						line = f"\033[4m{line}\033[24m"
+				elif i == active:
+					line = f"\033[7m{line}\033[0m"
+				lines.append(line)
+			if has_action_pane:
+				lines.append("⎯" * width)
+				if action_total:
+					action_label = f"Actions ({action_start + 1}-{action_start + len(action_lines)} of {action_total}; a older, q newer)" if action_lines else f"Actions ({action_total} entries; a older, q newer)"
+					lines.append(action_label[:width])
+					lines.extend(_color_action_line(line, width) for line in action_lines)
+				else:
+					lines.extend(["Actions (0 entries; a older, q newer)"[:width], "No actions yet."[:width]])
+			lines.extend(footer)
+			sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines[:rows]))
+			sys.stdout.flush()
+			readable, _, _ = select.select([fd], [], [], 0.2)
+			if not readable:
+				continue
+			key = _read_picker_key()
+			if key == "container_view": return "containers"
+			if key == "images": return "images"
+			if key == "quit": return "quit"
+			if key == "action_up": action_log.scroll(1)
+			elif key == "action_down": action_log.scroll(-1)
+			elif key in {"up", "home", "down", "end"}:
+				active = {"up": max(0, active - 1), "home": 0, "down": min(max(0, len(volumes) - 1), active + 1), "end": max(0, len(volumes) - 1)}[key]
+				if volumes: state.active_key = _volume_key(volumes[active])
+			elif key in {"left", "right"}:
+				columns = ["context", "name", "driver", "created", "used"]
+				index = columns.index(state.sort_column) if state.sort_column in columns else 0
+				state.sort_column = columns[(index + (-1 if key == "left" else 1)) % len(columns)]
+			elif key == "sort_direction": state.sort_ascending = not state.sort_ascending
+			elif key == "toggle" and volumes:
+				key = _volume_key(volumes[active])
+				if key in state.selected_keys: state.selected_keys.remove(key)
+				else: state.selected_keys.add(key)
+			elif key == "all": state.selected_keys = {_volume_key(v) for v in volumes}
+			elif key == "clear": state.selected_keys.clear()
+			elif key == "action_up": action_log.scroll(1)
+			elif key == "action_down": action_log.scroll(-1)
+			elif key == "delete" and volumes:
+				selected = state.selected_keys or {_volume_key(volumes[active])}
+				chosen = [v for v in volumes if _volume_key(v) in selected and _volume_key(v) not in pending]
+				names = [f"{v.get('_DocksideContext')}/{v.get('Name')}" for v in chosen]
+				if not chosen: continue
+				prompt = f"Delete volume {names[0]}?" if len(names) == 1 else f"Delete {len(names)} selected volumes?"
+				if _confirm_dialog(prompt, names, list_label="Volumes") is not True:
+					action_log.append("Volume deletion cancelled.")
+					continue
+				for v in chosen:
+					context = v.get("_DocksideContext")
+					api = next(t["api"] for t in targets if t["name"] == context)
+					pending[_volume_key(v)] = executor.submit(_run_volume_delete, api, v, action_log)
+					state.selected_keys.discard(_volume_key(v))
+	finally:
+		termios.tcsetattr(fd, termios.TCSADRAIN, original_terminal)
+		sys.stdout.write("\033[0m\n")
+		sys.stdout.flush()
 
 
 def _select_images(
@@ -1132,6 +1352,8 @@ def _select_images(
 			key = _read_picker_key()
 			if key == "container_view":
 				return "containers"
+			if key == "volumes":
+				return "volumes"
 			if key == "quit":
 				return "quit"
 			if key == "up":
@@ -1381,8 +1603,8 @@ def _select_containers(
 			if not containers:
 				if key == "quit":
 					return None
-				if key == "images":
-					return [], "images"
+				if key in {"images", "volumes"}:
+					return [], key
 				if key == "contexts":
 					return [], "contexts"
 				continue
@@ -1419,6 +1641,7 @@ def _select_containers(
 			elif key in {
 				"contexts",
 				"images",
+				"volumes",
 				"inspect",
 				"logs",
 				"stop",
@@ -1676,8 +1899,6 @@ def _pick_docker_context(
 ) -> list[dict[str, Any]] | None:
 	if not contexts:
 		return None
-	terminal_size = shutil.get_terminal_size((80, 24))
-	columns = max(1, terminal_size.columns - 1)
 	selected_contexts = {
 		index
 		for index, context in enumerate(contexts)
@@ -1693,7 +1914,9 @@ def _pick_docker_context(
 	try:
 		tty.setraw(file_descriptor)
 		while True:
-			lines = ["Docker contexts (Space toggles; Enter applies)", ""]
+			terminal_size = shutil.get_terminal_size((80, 24))
+			columns = max(1, terminal_size.columns - 1)
+			lines = ["Docker contexts (Space toggles; Enter applies)"[:columns], ""]
 			for index, context in enumerate(contexts):
 				current = " (current)" if context.get("Current") else ""
 				endpoint = context.get("DockerEndpoint", "")
@@ -1705,9 +1928,12 @@ def _pick_docker_context(
 				if index == selected_index:
 					line = f"\033[7m{line.ljust(columns)}\033[0m"
 				lines.append(line)
-			lines.extend(["", "Up/Down: move   Space: toggle   Enter: apply   q: cancel"])
+			lines.extend(["", "Up/Down: move   Space: toggle   Enter: apply   q: cancel"[:columns]])
 			sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines))
 			sys.stdout.flush()
+			readable, _, _ = select.select([file_descriptor], [], [], 0.2)
+			if not readable:
+				continue
 			key = _read_picker_key()
 			if key == "up":
 				selected_index = max(0, selected_index - 1)
@@ -1856,6 +2082,7 @@ def main() -> int:
 			registry_checks = ContextRegistryChecks(targets, executor)
 			picker_state = PickerState()
 			image_picker_state = ImagePickerState()
+			volume_picker_state = VolumePickerState()
 			action_log = ActionLog()
 			while True:
 				last_action_refresh = action_log.completion_generation()
@@ -1879,10 +2106,13 @@ def main() -> int:
 				if selection is None:
 					return 0
 				selected_containers, shortcut_action = selection
-				if shortcut_action == "images":
-					view = _select_images(
-						targets, image_picker_state, action_log, executor
-					)
+				if shortcut_action in {"images", "volumes"}:
+					view = shortcut_action
+					while view in {"images", "volumes"}:
+						if view == "images":
+							view = _select_images(targets, image_picker_state, action_log, executor)
+						else:
+							view = _select_volumes(targets, volume_picker_state, action_log, executor)
 					if view == "quit":
 						return 0
 					continue
