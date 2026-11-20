@@ -458,6 +458,21 @@ def _run_image_delete(
 	image_name = _image_name(image)
 	try:
 		api.remove_image(image["Id"])
+	except DockerError as error:
+		if "image is referenced in multiple repositories" not in str(error):
+			action_log.append(
+				f"ERROR deleting image {context_name}/{image_name}: {error}",
+				refresh=True,
+			)
+			return
+		try:
+			api.remove_image(image["Id"], force=True)
+		except (DockerError, OSError) as retry_error:
+			action_log.append(
+				f"ERROR deleting image {context_name}/{image_name}: {retry_error}",
+				refresh=True,
+			)
+			return
 	except (DockerError, OSError) as error:
 		action_log.append(
 			f"ERROR deleting image {context_name}/{image_name}: {error}",

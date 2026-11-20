@@ -205,11 +205,11 @@ class DockerAPI:
 	def list_images(self) -> list[dict[str, Any]]:
 		return self.request("GET", "/images/json", query={"all": 1})
 
-	def remove_image(self, image_id: str) -> None:
+	def remove_image(self, image_id: str, *, force: bool = False) -> None:
 		self.request(
 			"DELETE",
 			f"/images/{quote(image_id, safe='')}",
-			query={"force": 0, "noprune": 0},
+			query={"force": int(force), "noprune": 0},
 		)
 
 	def list_volumes(self) -> list[dict[str, Any]]:
