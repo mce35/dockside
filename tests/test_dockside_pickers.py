@@ -16,6 +16,17 @@ from docker_api import DockerAPI, DockerError
 from tests.helpers import mock_picker_terminal
 
 class TestDocksidePickerTests:
+	def test_volume_sort_columns_follow_display_order(self, monkeypatch) -> None:
+		api = Mock(daemon_version="25")
+		api.list_containers.return_value = []
+		api.list_volumes.return_value = [{"Name": "data", "Driver": "local"}]
+		target = {"name": "ctx", "endpoint": "unix:///docker", "api": api}
+		state = VolumePickerState(sort_column="name")
+		mock_picker_terminal(monkeypatch, ["right", "images"])
+		with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
+			dockside._select_volumes([target], state, ActionLog(), executor)
+		assert state.sort_column == "used"
+
 	def test_empty_image_and_volume_picker_routes(self, monkeypatch) -> None:
 		api = Mock(daemon_version="25", list_containers=Mock(return_value=[]), list_images=Mock(return_value=[]), list_volumes=Mock(return_value=[]))
 		target = {"name": "ctx", "endpoint": "unix:///docker", "api": api}
@@ -25,11 +36,11 @@ class TestDocksidePickerTests:
 		mock_picker_terminal(monkeypatch, ["down", "home", "end", "all", "clear", "toggle", "delete", "unknown", "container_view"])
 		with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
 			assert dockside._select_volumes([target], VolumePickerState(), ActionLog(), executor) == "containers"
-		for key, expected in [("container_view", "containers"), ("images", "images"), ("quit", "quit")]:
+		for key, expected in [("container_view", "containers"), ("images", "images"), ("contexts", "contexts"), ("quit", "quit")]:
 			mock_picker_terminal(monkeypatch, [key])
 			with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
 				assert dockside._select_volumes([target], VolumePickerState(), ActionLog(), executor) == expected
-		for key, expected in [("quit", "quit"), ("volumes", "volumes")]:
+		for key, expected in [("quit", "quit"), ("volumes", "volumes"), ("contexts", "contexts")]:
 			mock_picker_terminal(monkeypatch, [key])
 			with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
 				assert dockside._select_images([target], ImagePickerState(), ActionLog(), executor) == expected

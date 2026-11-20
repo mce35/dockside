@@ -1096,7 +1096,7 @@ def _render_image_picker(
 	has_action_pane = rows >= 7
 	footer_lines = (
 		[
-			"Up/Down move  Space select  Ctrl+A all  C clear  Left/Right sort  s direction",
+			"Up/Down move  Space select  Ctrl+A all  C clear  c contexts  Left/Right sort  s direction",
 			"a/q action log  Ctrl+D delete  Ctrl+Q quit",
 		]
 		if rows >= 9
@@ -1268,10 +1268,10 @@ def _select_volumes(
 				f"{volume_sort_label('created', 'CREATED', created_width)}")
 			has_action_pane = rows >= 7
 			footer = (
-				["Up/Down move  Space select  Ctrl+A all  C clear  Left/Right sort  s direction",
+				["Up/Down move  Space select  Ctrl+A all  C clear  c contexts  Left/Right sort  s direction",
 				 "a/q action log  Ctrl+D delete  Ctrl+Q quit"]
 				if rows >= 9
-				else ["a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+				else ["c contexts  a/q action log  Ctrl+D delete  Ctrl+Q quit"]
 				if rows >= 5
 				else []
 			)
@@ -1315,6 +1315,7 @@ def _select_volumes(
 			key = _read_picker_key()
 			if key == "container_view": return "containers"
 			if key == "images": return "images"
+			if key == "contexts": return "contexts"
 			if key == "quit": return "quit"
 			if key == "action_up": action_log.scroll(1)
 			elif key == "action_down": action_log.scroll(-1)
@@ -1322,7 +1323,7 @@ def _select_volumes(
 				active = {"up": max(0, active - 1), "home": 0, "down": min(max(0, len(volumes) - 1), active + 1), "end": max(0, len(volumes) - 1)}[key]
 				if volumes: state.active_key = _volume_key(volumes[active])
 			elif key in {"left", "right"}:
-				columns = ["context", "name", "driver", "created", "used"]
+				columns = ["context", "name", "used", "driver", "created"]
 				index = columns.index(state.sort_column) if state.sort_column in columns else 0
 				state.sort_column = columns[(index + (-1 if key == "left" else 1)) % len(columns)]
 			elif key == "sort_direction": state.sort_ascending = not state.sort_ascending
@@ -1409,6 +1410,8 @@ def _select_images(
 			key = _read_picker_key()
 			if key == "container_view":
 				return "containers"
+			if key == "contexts":
+				return "contexts"
 			if key == "volumes":
 				return "volumes"
 			if key == "quit":
@@ -2165,11 +2168,36 @@ def main() -> int:
 				selected_containers, shortcut_action = selection
 				if shortcut_action in {"images", "volumes"}:
 					view = shortcut_action
-					while view in {"images", "volumes"}:
+					context_return_view = view
+					while view in {"images", "volumes", "contexts"}:
 						if view == "images":
 							view = _select_images(targets, image_picker_state, action_log, executor)
-						else:
+							if view == "contexts":
+								context_return_view = "images"
+						elif view == "volumes":
 							view = _select_volumes(targets, volume_picker_state, action_log, executor)
+							if view == "contexts":
+								context_return_view = "volumes"
+						else:
+							try:
+								contexts = _docker_contexts()
+								selected_contexts = _pick_docker_context(
+									contexts, {target["name"] for target in targets}
+								)
+								if selected_contexts is not None:
+									targets = _targets_from_contexts(selected_contexts)
+									registry_checks = ContextRegistryChecks(targets, executor)
+									action_log.append(
+										"Switched to Docker contexts "
+										+ ", ".join(target["name"] for target in targets)
+										+ ".",
+										refresh=True,
+									)
+							except (DockerError, OSError, KeyError) as error:
+								action_log.append(
+									f"ERROR switching Docker context: {error}", refresh=True
+								)
+							view = context_return_view
 					if view == "quit":
 						return 0
 					continue
