@@ -25,6 +25,27 @@ class TestDocksideHelperTests:
 		api.remove_image.side_effect = DockerError("in use")
 		dockside._run_image_delete(api, image, log)
 		assert "ERROR deleting image" in log.entries[-1]
+
+	def test_image_delete_reports_dependent_children(self) -> None:
+		log = ActionLog()
+		api = Mock()
+		api.remove_image.side_effect = DockerError(
+			"Docker API 409: conflict: cannot be forced - image has dependent child images"
+		)
+		api.list_images.return_value = [
+			{"Id": "sha256:parent"},
+			{"Id": "sha256:child", "ParentId": "sha256:parent", "RepoTags": ["child:latest"]},
+			{"Id": "sha256:other", "ParentId": "sha256:different", "RepoTags": ["other:latest"]},
+			{"Id": "sha256:a43bb1234567890", "ParentId": "sha256:parent"},
+		]
+		dockside._run_image_delete(
+			api,
+			{"Id": "sha256:parent", "RepoTags": ["parent:latest"]},
+			log,
+		)
+		assert "dependent child images: child:latest" in log.entries[-1]
+		assert "sha256:a43bb1234567890" in log.entries[-1]
+		assert "other:latest" not in log.entries[-1]
 		ports = dockside._inspection_ports({"Ports": [
 			{"PrivatePort": None}, {"PrivatePort": 80},
 			{"PrivatePort": 81, "PublicPort": 8081, "IP": "127.0.0.1"},

@@ -451,6 +451,37 @@ def _list_context_volumes(targets: list[dict[str, Any]]) -> list[dict[str, Any]]
 	return volumes
 
 
+def _dependent_image_names(api: DockerAPI, image_id: str) -> list[str]:
+	"""Find locally listed images that report the given image as their parent."""
+	children = []
+	try:
+		for listed_image in api.list_images():
+			child_id = listed_image.get("Id", "")
+			if not child_id or child_id == image_id:
+				continue
+			parent_id = listed_image.get("ParentId") or listed_image.get("Parent")
+			if not parent_id:
+				try:
+					parent_id = api.inspect_image(child_id).get("Parent")
+				except (DockerError, OSError):
+					continue
+			if parent_id != image_id:
+				continue
+			names = [
+				tag for tag in listed_image.get("RepoTags") or []
+				if tag and tag != "<none>:<none>"
+			]
+			if not names:
+				names = [
+				digest for digest in listed_image.get("RepoDigests") or []
+				if digest
+			]
+			children.append(", ".join(sorted(names)) or child_id)
+	except (DockerError, OSError):
+		return []
+	return sorted(children)
+
+
 def _run_image_delete(
 	api: DockerAPI, image: dict[str, Any], action_log: ActionLog
 ) -> None:
@@ -459,9 +490,23 @@ def _run_image_delete(
 	try:
 		api.remove_image(image["Id"])
 	except DockerError as error:
+		dependent_images = (
+			_dependent_image_names(api, image["Id"])
+			if "dependent child images" in str(error)
+			else []
+		)
+		detail = (
+			f"; dependent child images: {', '.join(dependent_images)}"
+			if dependent_images
+			else (
+				"; Docker did not expose child image parent metadata"
+				if "dependent child images" in str(error)
+				else ""
+			)
+		)
 		if "image is referenced in multiple repositories" not in str(error):
 			action_log.append(
-				f"ERROR deleting image {context_name}/{image_name}: {error}",
+				f"ERROR deleting image {context_name}/{image_name}: {error}{detail}",
 				refresh=True,
 			)
 			return
@@ -469,7 +514,7 @@ def _run_image_delete(
 			api.remove_image(image["Id"], force=True)
 		except (DockerError, OSError) as retry_error:
 			action_log.append(
-				f"ERROR deleting image {context_name}/{image_name}: {retry_error}",
+				f"ERROR deleting image {context_name}/{image_name}: {retry_error}{detail}",
 				refresh=True,
 			)
 			return
