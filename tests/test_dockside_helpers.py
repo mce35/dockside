@@ -16,6 +16,22 @@ from docker_api import DockerAPI, DockerError
 from tests.helpers import mock_picker_terminal
 
 class TestDocksideHelperTests:
+	def test_image_and_volume_prune_helpers_log_results(self) -> None:
+		log = ActionLog()
+		image_api = Mock()
+		image_api.prune_images.return_value = {
+			"ImagesDeleted": [{"Deleted": "sha256:old"}],
+			"SpaceReclaimed": 1536,
+		}
+		dockside._run_image_prune([{"name": "ctx", "api": image_api}], log)
+		assert "Pruned 1 dangling image record(s) in ctx" in log.entries[-1]
+		assert "1.5 KiB" in log.entries[-1]
+
+		volume_api = Mock()
+		volume_api.prune_volumes.return_value = {"VolumesDeleted": ["old-volume"]}
+		dockside._run_volume_prune([{"name": "ctx", "api": volume_api}], log)
+		assert "Pruned 1 unused volume(s) in ctx" in log.entries[-1]
+
 	def test_image_delete_and_inspection_edge_cases(self) -> None:
 		log = ActionLog()
 		api = Mock()

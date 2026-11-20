@@ -148,6 +148,7 @@ def _read_picker_key() -> str:
 		"\x13": "stop",
 		"r": "restart",
 		"\x12": "recreate",
+		"\x10": "prune",
 		"p": "pull",
 		"\x04": "delete",
 		"\x03": "quit",
@@ -527,6 +528,30 @@ def _run_image_delete(
 		action_log.append(
 			f"Deleted image {context_name}/{image_name}.", refresh=True
 		)
+
+
+def _run_image_prune(targets: list[dict[str, Any]], action_log: ActionLog) -> None:
+	for target in targets:
+		context_name = target["name"]
+		try:
+			result = target["api"].prune_images() or {}
+		except (DockerError, OSError) as error:
+			action_log.append(
+				f"ERROR pruning images in {context_name}: {error}", refresh=True
+			)
+			continue
+		deleted = result.get("ImagesDeleted") or []
+		if deleted:
+			space_reclaimed = _format_bytes(result.get("SpaceReclaimed", 0))
+			action_log.append(
+				f"Pruned {len(deleted)} dangling image record(s) in {context_name}; "
+				f"reclaimed {space_reclaimed}.",
+				refresh=True,
+			)
+		else:
+			action_log.append(
+				f"No dangling images to prune in {context_name}.", refresh=True
+			)
 
 
 def _format_bytes(value: Any) -> str:
@@ -1097,10 +1122,10 @@ def _render_image_picker(
 	footer_lines = (
 		[
 			"Up/Down move  Space select  Ctrl+A all  C clear  c contexts  Left/Right sort  s direction",
-			"a/q action log  Ctrl+D delete  Ctrl+Q quit",
+			"a/q action log  Ctrl+D delete  Ctrl+P prune  Ctrl+Q quit",
 		]
 		if rows >= 9
-		else ["a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+		else ["a/q action log  Ctrl+D delete  Ctrl+P prune  Ctrl+Q quit"]
 		if rows >= 5
 		else []
 	)
@@ -1211,6 +1236,29 @@ def _run_volume_delete(api: DockerAPI, volume: dict[str, Any], action_log: Actio
 		action_log.append(f"ERROR deleting volume {context_name}/{name}: {error}", refresh=True)
 
 
+def _run_volume_prune(targets: list[dict[str, Any]], action_log: ActionLog) -> None:
+	for target in targets:
+		context_name = target["name"]
+		try:
+			result = target["api"].prune_volumes() or {}
+		except (DockerError, OSError) as error:
+			action_log.append(
+				f"ERROR pruning volumes in {context_name}: {error}", refresh=True
+			)
+			continue
+		deleted = result.get("VolumesDeleted") or []
+		if deleted:
+			action_log.append(
+				f"Pruned {len(deleted)} unused volume(s) in {context_name}.",
+				refresh=True,
+			)
+		else:
+			action_log.append(
+				f"No unused anonymous volumes to prune in {context_name}.",
+				refresh=True,
+			)
+
+
 def _select_volumes(
 	targets: list[dict[str, Any]],
 	state: VolumePickerState,
@@ -1269,9 +1317,9 @@ def _select_volumes(
 			has_action_pane = rows >= 7
 			footer = (
 				["Up/Down move  Space select  Ctrl+A all  C clear  c contexts  Left/Right sort  s direction",
-				 "a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+				 "a/q action log  Ctrl+D delete  Ctrl+P prune  Ctrl+Q quit"]
 				if rows >= 9
-				else ["c contexts  a/q action log  Ctrl+D delete  Ctrl+Q quit"]
+				else ["c contexts  a/q action log  Ctrl+D delete  Ctrl+P prune  Ctrl+Q quit"]
 				if rows >= 5
 				else []
 			)
@@ -1333,6 +1381,23 @@ def _select_volumes(
 				else: state.selected_keys.add(key)
 			elif key == "all": state.selected_keys = {_volume_key(v) for v in volumes}
 			elif key == "clear": state.selected_keys.clear()
+			elif key == "prune":
+				prune_key = "__prune__"
+				if prune_key in pending:
+					action_log.append("Volume pruning is already running.")
+					continue
+				if _confirm_dialog(
+					"Prune unused volumes across Docker contexts?",
+					[],
+					["Docker removes unused anonymous volumes by default."],
+					list_label="Volumes",
+				) is not True:
+					action_log.append("Volume pruning cancelled.")
+					continue
+				action_log.append("Pruning unused volumes in the background.")
+				pending[prune_key] = executor.submit(
+					_run_volume_prune, targets, action_log
+				)
 			elif key == "delete" and volumes:
 				selected = state.selected_keys or {_volume_key(volumes[active])}
 				chosen = [v for v in volumes if _volume_key(v) in selected and _volume_key(v) not in pending]
@@ -1454,6 +1519,23 @@ def _select_images(
 				state.selected_keys = {_image_key(image) for image in images}
 			elif key == "clear":
 				state.selected_keys.clear()
+			elif key == "prune":
+				prune_key = "__prune__"
+				if prune_key in pending_deletes:
+					action_log.append("Image pruning is already running.")
+					continue
+				if _confirm_dialog(
+					"Prune dangling images across Docker contexts?",
+					[],
+					["Docker removes dangling images by default."],
+					list_label="Images",
+				) is not True:
+					action_log.append("Image pruning cancelled.")
+					continue
+				action_log.append("Pruning dangling images in the background.")
+				pending_deletes[prune_key] = executor.submit(
+					_run_image_prune, targets, action_log
+				)
 			elif key == "delete" and images:
 				selected_keys = state.selected_keys or {
 					_image_key(images[active_index])

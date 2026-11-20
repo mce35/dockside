@@ -16,6 +16,26 @@ from docker_api import DockerAPI, DockerError
 from tests.helpers import mock_picker_terminal
 
 class TestDocksidePickerTests:
+	def test_prune_shortcut_dispatches_in_image_and_volume_views(self, monkeypatch) -> None:
+		api = Mock(daemon_version="25")
+		api.list_containers.return_value = []
+		api.list_images.return_value = []
+		api.list_volumes.return_value = []
+		api.prune_images.return_value = {"ImagesDeleted": [], "SpaceReclaimed": 0}
+		api.prune_volumes.return_value = {"VolumesDeleted": []}
+		target = {"name": "ctx", "endpoint": "unix:///docker", "api": api}
+		log = ActionLog()
+		monkeypatch.setattr(dockside, "_confirm_dialog", lambda *args, **kwargs: True)
+		mock_picker_terminal(monkeypatch, ["prune", "quit"])
+		with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
+			assert dockside._select_images([target], ImagePickerState(), log, executor) == "quit"
+		api.prune_images.assert_called_once_with()
+
+		mock_picker_terminal(monkeypatch, ["prune", "quit"])
+		with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as executor:
+			assert dockside._select_volumes([target], VolumePickerState(), log, executor) == "quit"
+		api.prune_volumes.assert_called_once_with()
+
 	def test_volume_sort_columns_follow_display_order(self, monkeypatch) -> None:
 		api = Mock(daemon_version="25")
 		api.list_containers.return_value = []
@@ -271,7 +291,7 @@ class TestDocksidePickerTests:
 		for sequence, expected in [("\x1bOP", "container_view"), ("\x1bOQ", "images"), ("\x1bOR", "volumes"), ("\x1b[13~", "volumes")]:
 			with patch("sys.stdin", io.StringIO(sequence)):
 				assert dockside._read_picker_key() == expected
-		for sequence, expected in [("\x04", "delete"), ("\x01", "all"), ("\x13", "stop"), ("\x12", "recreate")]:
+		for sequence, expected in [("\x04", "delete"), ("\x01", "all"), ("\x13", "stop"), ("\x12", "recreate"), ("\x10", "prune")]:
 			with patch("sys.stdin", io.StringIO(sequence)):
 				assert dockside._read_picker_key() == expected
 

@@ -196,3 +196,12 @@ class TestDockerAPITests:
 		assert request.call_args_list[0].args == ("GET", "/volumes")
 		assert request.call_args_list[1].args == ("DELETE", "/volumes/data")
 
+	def test_image_and_volume_prune_use_engine_endpoints(self) -> None:
+		api = DockerAPI.__new__(DockerAPI)
+		api.api_version, api.socket_path = "1.45", "/tmp/docker.sock"
+		with patch.object(api, "request", return_value={}) as request:
+			api.prune_images()
+			api.prune_volumes()
+		assert request.call_args_list[0].args == ("POST", "/images/prune")
+		assert request.call_args_list[1].args == ("POST", "/volumes/prune")
+
